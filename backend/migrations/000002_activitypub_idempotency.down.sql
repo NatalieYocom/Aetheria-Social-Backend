@@ -1,0 +1,2 @@
+DROP INDEX IF EXISTS outbox_jobs_activity_target_unique_idx;
+DROP INDEX IF EXISTS inbox_messages_activity_uri_unique_idx;

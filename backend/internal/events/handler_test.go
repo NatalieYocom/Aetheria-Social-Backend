@@ -1,0 +1,188 @@
+package events
+
+import (
+	"database/sql"
+	"net/http"
+	"net/http/httptest"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"basisvr-social-service/internal/auth"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+)
+
+func TestGetPrivateEventWithoutViewerReturnsNotFound(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newEventTestRouter(db, nil)
+	eventID := uuid.New()
+	worldID := uuid.New()
+	ownerID := uuid.New()
+	start := time.Now().UTC().Add(time.Hour)
+	end := start.Add(time.Hour)
+
+	mock.ExpectQuery(regexp.QuoteMeta(eventQuery() + ` WHERE e.slug = $1`)).
+		WithArgs("private-event").
+		WillReturnRows(eventRows().AddRow(
+			eventID,
+			"private-event",
+			"Private Event",
+			"",
+			start,
+			end,
+			"basis://event/private",
+			"private",
+			[]byte(`{}`),
+			ownerID,
+			"owner@example.social",
+			"Owner",
+			worldID,
+			"private-world",
+			"Private World",
+		))
+
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/events/private-event", nil))
+
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGetFriendsEventAllowsAcceptedFriend(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newEventTestRouter(db, &testPrincipal)
+	eventID := uuid.New()
+	worldID := uuid.New()
+	ownerID := uuid.New()
+	start := time.Now().UTC().Add(time.Hour)
+	end := start.Add(time.Hour)
+
+	mock.ExpectQuery(regexp.QuoteMeta(eventQuery() + ` WHERE e.slug = $1`)).
+		WithArgs("friends-event").
+		WillReturnRows(eventRows().AddRow(
+			eventID,
+			"friends-event",
+			"Friends Event",
+			"",
+			start,
+			end,
+			"basis://event/friends",
+			"friends",
+			[]byte(`{}`),
+			ownerID,
+			"owner@example.social",
+			"Owner",
+			worldID,
+			"friends-world",
+			"Friends World",
+		))
+	mock.ExpectQuery("SELECT EXISTS").
+		WithArgs(testPrincipal.ActorID, ownerID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/events/friends-event", nil))
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	if !strings.Contains(res.Body.String(), `"slug":"friends-event"`) {
+		t.Fatalf("body = %s", res.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCreateEventInHiddenWorldWithoutAccessReturnsNotFound(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newEventTestRouter(db, &testPrincipal)
+	worldID := uuid.New()
+	ownerID := uuid.New()
+	start := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	end := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339)
+
+	mock.ExpectQuery("SELECT owner_actor_id, visibility FROM worlds WHERE id").
+		WithArgs(worldID).
+		WillReturnRows(sqlmock.NewRows([]string{"owner_actor_id", "visibility"}).AddRow(ownerID, "private"))
+
+	body := `{"worldId":"` + worldID.String() + `","name":"Hidden Event","startTime":"` + start + `","endTime":"` + end + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/events", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func newMockDB(t *testing.T) (*sql.DB, sqlmock.Sqlmock) {
+	t.Helper()
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	return db, mock
+}
+
+var testPrincipal = auth.Principal{
+	UserID:   uuid.MustParse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+	ActorID:  uuid.MustParse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+	Username: "alice",
+}
+
+func newEventTestRouter(db *sql.DB, principal *auth.Principal) http.Handler {
+	r := chi.NewRouter()
+	if principal != nil {
+		r.Use(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				next.ServeHTTP(w, r.WithContext(auth.ContextWithPrincipal(r.Context(), *principal)))
+			})
+		})
+	}
+	RegisterRoutes(r, NewHandler(db, "https://social.example"), func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if principal == nil {
+				http.Error(w, "missing test principal", http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(auth.ContextWithPrincipal(r.Context(), *principal)))
+		})
+	})
+	return r
+}
+
+func eventRows() *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"id",
+		"slug",
+		"name",
+		"description",
+		"start_time",
+		"end_time",
+		"launch_url",
+		"visibility",
+		"metadata",
+		"actor_id",
+		"acct",
+		"display_name",
+		"world_id",
+		"world_slug",
+		"world_name",
+	})
+}

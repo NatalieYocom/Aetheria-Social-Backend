@@ -1,0 +1,96 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: basis_social
+      POSTGRES_USER: basis
+      POSTGRES_PASSWORD: basis
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U basis -d basis_social"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: basis
+      MINIO_ROOT_PASSWORD: basis-basis
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      API_BIND: 0.0.0.0:8080
+      PUBLIC_URL: http://localhost:8080
+      DATABASE_URL: postgres://basis:basis@postgres:5432/basis_social?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      REALTIME_BUFFER_SIZE: 128
+      REALTIME_BUS_BUFFER_SIZE: 1024
+      REALTIME_REDIS_CHANNEL: basisvr:realtime:v1
+      REALTIME_REDIS_PUBLISH_TIMEOUT: 2s
+      PRESENCE_SWEEP_INTERVAL: 15s
+      PRESENCE_SWEEP_BATCH_SIZE: 500
+      MAX_REQUEST_BODY_BYTES: 8388608
+      RATE_LIMIT_ENABLED: "true"
+      RATE_LIMIT_REQUESTS: 600
+      RATE_LIMIT_WINDOW: 1m
+      METRICS_ENABLED: "true"
+      JSON_LOGS_ENABLED: "true"
+      READINESS_TIMEOUT: 2s
+      JWT_SECRET: dev-secret-change-me
+      REGISTRATION_ENABLED: "true"
+      FEDERATION_MODE: disabled
+      ACTIVITYPUB_ENABLED: "false"
+      ACTIVITYPUB_DOMAIN: localhost
+      ASSET_CATALOG_ENABLED: "false"
+      ASSET_CATALOG_CODE: beeba
+      ASSET_CATALOG_NAME: BeeBa Asset Catalog
+      ASSET_CATALOG_KIND: beeba
+      ASSET_CATALOG_BASE_URL: ""
+      ASSET_CATALOG_API_BASE_URL: ""
+      ASSET_CATALOG_API_TOKEN: ""
+      ASSET_CATALOG_TIMEOUT: 5s
+    command: ["/bin/sh", "-c", "/app/migrate up && /app/api"]
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+
+  delivery:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_URL: postgres://basis:basis@postgres:5432/basis_social?sslmode=disable
+      ACTIVITYPUB_FETCH_TIMEOUT: 10s
+      ACTIVITYPUB_MAX_DELIVERY_ATTEMPTS: 6
+    command: ["/app/delivery"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  minio_data:

@@ -1,1 +1,7 @@
 .vscode/*
+/AGENT
+.env
+backend/.env
+backend/bin/
+backend/coverage.out
+backend/tmp/
