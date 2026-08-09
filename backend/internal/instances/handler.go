@@ -37,12 +37,21 @@ func RegisterRoutes(r chi.Router, h *Handler, authMiddleware func(http.Handler) 
 	r.Group(func(r chi.Router) {
 		r.Use(authMiddleware)
 		r.Post("/api/instances", h.Create)
+		r.Post("/api/instances/{id}/join-tickets", h.IssueJoinTicket)
 		r.Post("/api/instances/{id}/join", h.Join)
 		r.Post("/api/instances/{id}/heartbeat", h.Heartbeat)
 		r.Post("/api/instances/{id}/leave", h.Leave)
 		r.Patch("/api/instances/{id}", h.Update)
 		r.Delete("/api/instances/{id}", h.Delete)
+		r.Get("/api/admin/world-server-credentials", h.ListWorldServerCredentials)
+		r.Post("/api/admin/world-server-credentials", h.CreateWorldServerCredential)
+		r.Delete("/api/admin/world-server-credentials/{credentialId}", h.RevokeWorldServerCredential)
+		r.Get("/api/admin/instance-join-audit", h.ListInstanceJoinAudit)
 	})
+	r.Post("/api/service/instance-join-tickets/consume", h.ConsumeJoinTicket)
+	r.Post("/api/service/instances/{id}/heartbeat", h.ServiceInstanceHeartbeat)
+	r.Post("/api/service/instances/{id}/members/{actorId}/heartbeat", h.ServiceMemberHeartbeat)
+	r.Delete("/api/service/instances/{id}/members/{actorId}", h.ServiceMemberLeave)
 }
 
 type createInstanceRequest struct {
@@ -113,6 +122,19 @@ SELECT EXISTS (
   WHERE instance_id = $1 AND actor_id = $2 AND state = 'joined'
 )`
 
+const lockActorSQL = `SELECT id FROM actors WHERE id = $1 FOR UPDATE`
+
+const leaveOtherInstancesSQL = `
+UPDATE instance_members
+SET state = 'left', left_at = now(), last_seen_at = now()
+WHERE actor_id = $1 AND instance_id <> $2 AND state = 'joined'
+RETURNING instance_id`
+
+const decrementPreviousInstanceUsersSQL = `
+UPDATE instances
+SET current_users = GREATEST(current_users - 1, 0)
+WHERE id = $1`
+
 const loadInstanceSQL = `
 SELECT id, world_id, host_actor_id, instance_key, name, visibility, launch_url, capacity, current_users, status, expires_at, metadata
 FROM instances
@@ -145,16 +167,28 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	if req.Name == "" {
 		req.Name = "BasisVR instance"
 	}
+	if len(req.Name) > 120 {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_name", "name must be 120 characters or fewer")
+		return
+	}
+	req.InstanceKey = strings.TrimSpace(req.InstanceKey)
 	if req.InstanceKey == "" {
 		req.InstanceKey = uuid.NewString()
 	}
+	req.Visibility = normalizeInstanceVisibility(req.Visibility)
 	if req.Visibility == "" {
-		req.Visibility = "public"
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_visibility", "visibility must be public, friends, invite_only or private")
+		return
 	}
 	if req.Capacity < 0 {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_capacity", "capacity cannot be negative")
 		return
 	}
+	if req.ExpiresAt != nil && !req.ExpiresAt.After(time.Now().UTC()) {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_expiration", "expiresAt must be in the future")
+		return
+	}
+	req.LaunchURL = strings.TrimSpace(req.LaunchURL)
 	allowed, err := h.canViewWorldByID(r.Context(), req.WorldID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -268,6 +302,10 @@ func (h *Handler) Join(w http.ResponseWriter, r *http.Request) {
 			_ = tx.Rollback()
 		}
 	}()
+	if err := lockActor(r.Context(), tx, principal.ActorID); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "join_instance_failed", err.Error())
+		return
+	}
 
 	target, err := h.loadJoinTarget(r.Context(), tx, id)
 	if err != nil {
@@ -298,6 +336,11 @@ func (h *Handler) Join(w http.ResponseWriter, r *http.Request) {
 	}
 	if target.capacityReached() && !alreadyJoined {
 		httpx.WriteError(w, http.StatusConflict, "instance_full", "instance capacity has been reached")
+		return
+	}
+	leftInstances, err := h.leaveOtherInstances(r.Context(), tx, principal.ActorID, id)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "join_instance_failed", err.Error())
 		return
 	}
 
@@ -347,6 +390,9 @@ DO UPDATE SET world_id = EXCLUDED.world_id,
 		return
 	}
 	_ = realtime.PublishPresenceChanged(r.Context(), h.db, h.events, principal.ActorID)
+	for _, previousInstanceID := range leftInstances {
+		_ = realtime.PublishInstanceChanged(r.Context(), h.db, h.events, previousInstanceID, "instance.updated")
+	}
 	_ = realtime.PublishInstanceChanged(r.Context(), h.db, h.events, id, "instance.updated")
 	httpx.WriteJSON(w, http.StatusOK, instance)
 }
@@ -533,6 +579,38 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
+	if req.CurrentUsers != nil || req.Status != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "immutable_field", "currentUsers and status are managed by instance lifecycle endpoints")
+		return
+	}
+	if req.Name != nil {
+		value := strings.TrimSpace(*req.Name)
+		if value == "" || len(value) > 120 {
+			httpx.WriteError(w, http.StatusBadRequest, "invalid_name", "name must contain 1 to 120 characters")
+			return
+		}
+		req.Name = &value
+	}
+	if req.Visibility != nil {
+		value := normalizeInstanceVisibility(*req.Visibility)
+		if value == "" {
+			httpx.WriteError(w, http.StatusBadRequest, "invalid_visibility", "visibility must be public, friends, invite_only or private")
+			return
+		}
+		req.Visibility = &value
+	}
+	if req.Capacity != nil && *req.Capacity < 0 {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_capacity", "capacity cannot be negative")
+		return
+	}
+	if req.ExpiresAt != nil && !req.ExpiresAt.After(time.Now().UTC()) {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_expiration", "expiresAt must be in the future")
+		return
+	}
+	if req.LaunchURL != nil {
+		value := strings.TrimSpace(*req.LaunchURL)
+		req.LaunchURL = &value
+	}
 	var metadata any
 	if req.Metadata != nil {
 		data, err := dbx.MarshalJSON(*req.Metadata, "{}")
@@ -543,28 +621,31 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		metadata = data
 	}
 
-	if _, err := h.db.ExecContext(r.Context(), `
+	result, err := h.db.ExecContext(r.Context(), `
 UPDATE instances
 SET name = COALESCE($2, name),
     visibility = COALESCE($3, visibility),
     launch_url = COALESCE($4, launch_url),
     capacity = COALESCE($5, capacity),
-    current_users = COALESCE($6, current_users),
-    status = COALESCE($7, status),
-    expires_at = COALESCE($8, expires_at),
-    metadata = COALESCE($9::jsonb, metadata)
-WHERE id = $1`,
+    expires_at = COALESCE($6, expires_at),
+    metadata = COALESCE($7::jsonb, metadata)
+WHERE id = $1
+  AND (COALESCE($5, capacity) = 0 OR COALESCE($5, capacity) >= current_users)`,
 		id,
 		dbx.NullString(req.Name),
 		dbx.NullString(req.Visibility),
 		dbx.NullString(req.LaunchURL),
 		nullInt(req.Capacity),
-		nullInt(req.CurrentUsers),
-		dbx.NullString(req.Status),
 		nullTimePtr(req.ExpiresAt),
 		metadata,
-	); err != nil {
+	)
+	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "update_instance_failed", err.Error())
+		return
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		httpx.WriteError(w, http.StatusConflict, "capacity_below_occupancy", "capacity cannot be lower than currentUsers")
 		return
 	}
 
@@ -591,9 +672,74 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusForbidden, "forbidden", "only host can close this instance")
 		return
 	}
-	if _, err := h.db.ExecContext(r.Context(), `UPDATE instances SET status = 'closed' WHERE id = $1`, id); err != nil {
+	tx, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "close_instance_failed", err.Error())
 		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if _, err := tx.ExecContext(r.Context(), `
+UPDATE instances
+SET status = 'closed', current_users = 0
+WHERE id = $1`, id); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "close_instance_failed", err.Error())
+		return
+	}
+	if _, err := tx.ExecContext(r.Context(), `
+UPDATE instance_members
+SET state = 'left', left_at = now(), last_seen_at = now()
+WHERE instance_id = $1 AND state = 'joined'`, id); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "close_instance_failed", err.Error())
+		return
+	}
+	rows, err := tx.QueryContext(r.Context(), `
+DELETE FROM presence_sessions
+WHERE instance_id = $1
+RETURNING actor_id, visibility`, id)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "close_instance_failed", err.Error())
+		return
+	}
+	type removedPresence struct {
+		actorID    uuid.UUID
+		visibility string
+	}
+	removed := []removedPresence{}
+	for rows.Next() {
+		var item removedPresence
+		if err := rows.Scan(&item.actorID, &item.visibility); err != nil {
+			_ = rows.Close()
+			httpx.WriteError(w, http.StatusInternalServerError, "close_instance_failed", err.Error())
+			return
+		}
+		removed = append(removed, item)
+	}
+	if err := rows.Close(); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "close_instance_failed", err.Error())
+		return
+	}
+	if err := rows.Err(); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "close_instance_failed", err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "close_instance_failed", err.Error())
+		return
+	}
+	committed = true
+	for _, item := range removed {
+		if item.visibility == "friends" || item.visibility == "public" {
+			_ = realtime.PublishPresenceRemoved(r.Context(), h.db, h.events, item.actorID)
+		} else {
+			realtime.PublishActorEvent(h.events, []uuid.UUID{item.actorID}, "presence.removed", item.actorID, map[string]string{
+				"actorId": item.actorID.String(),
+			})
+		}
 	}
 	_ = realtime.PublishInstanceChanged(r.Context(), h.db, h.events, id, "instance.closed")
 	w.WriteHeader(http.StatusNoContent)
@@ -820,6 +966,40 @@ ON CONFLICT (instance_id, actor_id) DO NOTHING`,
 	return inserted, nil
 }
 
+func lockActor(ctx context.Context, tx *sql.Tx, actorID uuid.UUID) error {
+	var lockedID uuid.UUID
+	return tx.QueryRowContext(ctx, lockActorSQL, actorID).Scan(&lockedID)
+}
+
+func (h *Handler) leaveOtherInstances(ctx context.Context, tx *sql.Tx, actorID uuid.UUID, targetInstanceID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := tx.QueryContext(ctx, leaveOtherInstancesSQL, actorID, targetInstanceID)
+	if err != nil {
+		return nil, err
+	}
+
+	left := []uuid.UUID{}
+	for rows.Next() {
+		var instanceID uuid.UUID
+		if err := rows.Scan(&instanceID); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		left = append(left, instanceID)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, instanceID := range left {
+		if _, err := tx.ExecContext(ctx, decrementPreviousInstanceUsersSQL, instanceID); err != nil {
+			return nil, err
+		}
+	}
+	return left, nil
+}
+
 type scanner interface {
 	Scan(dest ...any) error
 }
@@ -894,6 +1074,19 @@ func normalizePresenceStatus(value string) string {
 	}
 	switch value {
 	case "online", "away", "busy", "invisible":
+		return value
+	default:
+		return ""
+	}
+}
+
+func normalizeInstanceVisibility(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "public"
+	}
+	switch value {
+	case "public", "friends", "invite_only", "private":
 		return value
 	default:
 		return ""

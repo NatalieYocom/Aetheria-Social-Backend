@@ -165,3 +165,35 @@ func TestBeeBaClientSearchAssetsMapsPublicContentPage(t *testing.T) {
 		t.Fatalf("Metadata = %#v", item.Metadata)
 	}
 }
+
+func TestBeeBaClientCheckHealthUsesReadyzContract(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/readyz" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ready","service":"beeba"}`))
+	}))
+	defer server.Close()
+	client := NewBeeBaClient(BeeBaClientConfig{
+		Catalog:    Catalog{BaseURL: server.URL, APIBaseURL: server.URL + "/api/v1"},
+		HTTPClient: server.Client(),
+	})
+	if err := client.CheckHealth(context.Background()); err != nil {
+		t.Fatalf("CheckHealth: %v", err)
+	}
+}
+
+func TestBeeBaClientCheckHealthRejectsNotReadyStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"status":"not_ready"}`))
+	}))
+	defer server.Close()
+	client := NewBeeBaClient(BeeBaClientConfig{
+		Catalog: Catalog{BaseURL: server.URL}, HTTPClient: server.Client(),
+	})
+	if err := client.CheckHealth(context.Background()); err == nil {
+		t.Fatal("expected unavailable error")
+	}
+}

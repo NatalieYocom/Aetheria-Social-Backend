@@ -13,6 +13,7 @@ import (
 	"basisvr-social-service/internal/auth"
 	"basisvr-social-service/internal/common/dbx"
 	"basisvr-social-service/internal/common/httpx"
+	"basisvr-social-service/internal/common/page"
 	"basisvr-social-service/internal/privacy"
 
 	"github.com/go-chi/chi/v5"
@@ -98,6 +99,18 @@ type worldResponse struct {
 const worldAccessTargetSQL = `SELECT owner_actor_id, visibility FROM worlds WHERE id = $1`
 const eventAccessTargetSQL = `SELECT owner_actor_id, visibility FROM events WHERE id = $1`
 
+const listEventsSQL = `
+SELECT e.id, e.slug, e.name, e.description, e.start_time, e.end_time, e.launch_url, e.visibility, e.metadata,
+       a.id, a.acct, a.display_name,
+       w.id, w.slug, w.name
+FROM events e
+JOIN actors a ON a.id = e.owner_actor_id
+JOIN worlds w ON w.id = e.world_id
+WHERE e.visibility = 'public'
+  AND ($1::timestamptz IS NULL OR (e.start_time, e.id) > ($1, $2))
+ORDER BY e.start_time ASC, e.id ASC
+LIMIT $3`
+
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	principal, err := auth.RequirePrincipal(r.Context())
 	if err != nil {
@@ -179,16 +192,18 @@ RETURNING id`,
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.db.QueryContext(r.Context(), `
-SELECT e.id, e.slug, e.name, e.description, e.start_time, e.end_time, e.launch_url, e.visibility, e.metadata,
-       a.id, a.acct, a.display_name,
-       w.id, w.slug, w.name
-FROM events e
-JOIN actors a ON a.id = e.owner_actor_id
-JOIN worlds w ON w.id = e.world_id
-WHERE e.visibility = 'public'
-ORDER BY e.start_time ASC
-LIMIT 100`)
+	requestPage, err := page.ParseRequest(r, 24, 100)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_pagination", err.Error())
+		return
+	}
+	var cursorTime any
+	cursorID := uuid.Nil
+	if requestPage.Cursor != nil {
+		cursorTime = requestPage.Cursor.SortTime
+		cursorID = requestPage.Cursor.ID
+	}
+	rows, err := h.db.QueryContext(r.Context(), listEventsSQL, cursorTime, cursorID, requestPage.Limit+1)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "list_events_failed", err.Error())
 		return
@@ -208,7 +223,15 @@ LIMIT 100`)
 		httpx.WriteError(w, http.StatusInternalServerError, "list_events_failed", err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, events)
+	nextCursor := (*string)(nil)
+	if len(events) > requestPage.Limit {
+		last := events[requestPage.Limit-1]
+		nextCursor = page.NextCursor(page.Cursor{SortTime: last.StartTime, ID: last.ID})
+		events = events[:requestPage.Limit]
+	}
+	httpx.WriteJSON(w, http.StatusOK, page.Response[EventResponse]{
+		Data: events, Pagination: page.Metadata{NextCursor: nextCursor, Limit: requestPage.Limit},
+	})
 }
 
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {

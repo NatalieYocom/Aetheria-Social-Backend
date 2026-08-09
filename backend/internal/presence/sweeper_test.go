@@ -18,20 +18,29 @@ func TestSweeperDeletesExpiredPresenceAndPublishesRemoval(t *testing.T) {
 	broker := realtime.NewBroker(realtime.BrokerConfig{BufferSize: 4})
 	actorID := uuid.New()
 	friendID := uuid.New()
+	instanceID := uuid.New()
 	selfEvents, unsubscribeSelf := broker.Subscribe(context.Background(), actorID)
 	defer unsubscribeSelf()
 	friendEvents, unsubscribeFriend := broker.Subscribe(context.Background(), friendID)
 	defer unsubscribeFriend()
 
-	mock.ExpectQuery(regexp.QuoteMeta(expiredPresenceSelectSQL)).
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(expiredPresenceDeleteBatchSQL)).
 		WithArgs(10).
-		WillReturnRows(sqlmock.NewRows([]string{"actor_id", "visibility"}).AddRow(actorID, "friends"))
-	mock.ExpectExec(regexp.QuoteMeta(expiredPresenceDeleteSQL)).
-		WithArgs(actorID).
+		WillReturnRows(sqlmock.NewRows([]string{"actor_id", "visibility", "instance_id"}).AddRow(actorID, "friends", instanceID))
+	mock.ExpectExec(regexp.QuoteMeta(expireInstanceMemberSQL)).
+		WithArgs(instanceID, actorID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(decrementInstanceUsersSQL)).
+		WithArgs(instanceID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 	mock.ExpectQuery("SELECT actor_id").
 		WithArgs(actorID).
 		WillReturnRows(sqlmock.NewRows([]string{"actor_id"}).AddRow(friendID))
+	mock.ExpectQuery("SELECT host_actor_id AS actor_id").
+		WithArgs(instanceID).
+		WillReturnRows(sqlmock.NewRows([]string{"actor_id"}))
 
 	count, err := NewSweeper(db, broker, SweeperConfig{BatchSize: 10}).SweepExpired(context.Background())
 	if err != nil {
@@ -57,12 +66,11 @@ func TestSweeperDoesNotNotifyFriendsForPrivateExpiredPresence(t *testing.T) {
 	friendEvents, unsubscribeFriend := broker.Subscribe(context.Background(), friendID)
 	defer unsubscribeFriend()
 
-	mock.ExpectQuery(regexp.QuoteMeta(expiredPresenceSelectSQL)).
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(expiredPresenceDeleteBatchSQL)).
 		WithArgs(10).
-		WillReturnRows(sqlmock.NewRows([]string{"actor_id", "visibility"}).AddRow(actorID, "nobody"))
-	mock.ExpectExec(regexp.QuoteMeta(expiredPresenceDeleteSQL)).
-		WithArgs(actorID).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+		WillReturnRows(sqlmock.NewRows([]string{"actor_id", "visibility", "instance_id"}).AddRow(actorID, "nobody", nil))
+	mock.ExpectCommit()
 
 	count, err := NewSweeper(db, broker, SweeperConfig{BatchSize: 10}).SweepExpired(context.Background())
 	if err != nil {
@@ -85,12 +93,11 @@ func TestSweeperSkipsPublishWhenExpiredPresenceWasAlreadyDeleted(t *testing.T) {
 	selfEvents, unsubscribeSelf := broker.Subscribe(context.Background(), actorID)
 	defer unsubscribeSelf()
 
-	mock.ExpectQuery(regexp.QuoteMeta(expiredPresenceSelectSQL)).
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(expiredPresenceDeleteBatchSQL)).
 		WithArgs(10).
-		WillReturnRows(sqlmock.NewRows([]string{"actor_id", "visibility"}).AddRow(actorID, "friends"))
-	mock.ExpectExec(regexp.QuoteMeta(expiredPresenceDeleteSQL)).
-		WithArgs(actorID).
-		WillReturnResult(sqlmock.NewResult(0, 0))
+		WillReturnRows(sqlmock.NewRows([]string{"actor_id", "visibility", "instance_id"}))
+	mock.ExpectCommit()
 
 	count, err := NewSweeper(db, broker, SweeperConfig{BatchSize: 10}).SweepExpired(context.Background())
 	if err != nil {

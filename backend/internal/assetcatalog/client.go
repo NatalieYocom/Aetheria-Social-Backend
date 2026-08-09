@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"path"
@@ -15,6 +16,10 @@ import (
 type CatalogClient interface {
 	ResolveAsset(ctx context.Context, externalID string) (ResolvedAsset, error)
 	SearchAssets(ctx context.Context, query SearchQuery) (SearchPage, error)
+}
+
+type CatalogHealthChecker interface {
+	CheckHealth(ctx context.Context) error
 }
 
 var ErrAssetNotFound = errors.New("asset not found in catalog")
@@ -61,6 +66,36 @@ func NewBeeBaClient(cfg BeeBaClientConfig) *BeeBaClient {
 	cfg.Catalog.BaseURL = strings.TrimRight(cfg.Catalog.BaseURL, "/")
 	cfg.Catalog.APIBaseURL = strings.TrimRight(cfg.Catalog.APIBaseURL, "/")
 	return &BeeBaClient{catalog: cfg.Catalog, token: cfg.APIToken, client: client}
+}
+
+func (c *BeeBaClient) CheckHealth(ctx context.Context) error {
+	if c.catalog.BaseURL == "" {
+		return errors.New("beeba base url is not configured")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, joinURL(c.catalog.BaseURL, "readyz"), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	res, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return fmt.Errorf("catalog readiness returned %s", res.Status)
+	}
+	var response struct {
+		Status string `json:"status"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(res.Body, 64*1024))
+	if err := decoder.Decode(&response); err != nil {
+		return fmt.Errorf("decode catalog readiness: %w", err)
+	}
+	if response.Status != "ready" {
+		return fmt.Errorf("catalog readiness status is %q", response.Status)
+	}
+	return nil
 }
 
 func (c *BeeBaClient) ResolveAsset(ctx context.Context, externalID string) (ResolvedAsset, error) {

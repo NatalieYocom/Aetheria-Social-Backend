@@ -136,6 +136,12 @@ type SearchResponse struct {
 	NextCursor string               `json:"nextCursor"`
 }
 
+type CatalogStatusResponse struct {
+	CatalogCode string    `json:"catalogCode"`
+	Status      string    `json:"status"`
+	CheckedAt   time.Time `json:"checkedAt"`
+}
+
 func catalogResponse(catalog Catalog) CatalogResponse {
 	return CatalogResponse{
 		ID:         catalog.ID,

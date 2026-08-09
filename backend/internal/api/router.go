@@ -39,6 +39,7 @@ func NewRouter(deps Deps) http.Handler {
 		appCtx = context.Background()
 	}
 	r := chi.NewRouter()
+	r.Use(versionedAPI)
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	if deps.Config.Observability.JSONLogsEnabled {
@@ -88,6 +89,10 @@ func NewRouter(deps Deps) http.Handler {
 		Interval:  deps.Config.Presence.SweepInterval,
 		BatchSize: deps.Config.Presence.SweepBatchSize,
 	}).Run(appCtx)
+	go instances.NewRuntimeSweeper(deps.DB, realtimeBroker, instances.RuntimeSweeperConfig{
+		Interval:  deps.Config.Presence.SweepInterval,
+		BatchSize: deps.Config.Presence.SweepBatchSize,
+	}).Run(appCtx)
 
 	readinessChecks := []observability.Check{observability.DatabaseCheck(deps.DB)}
 	if deps.Config.Redis.URL != "" {
@@ -113,6 +118,7 @@ func NewRouter(deps Deps) http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
+	r.Get("/openapi.json", serveOpenAPI)
 	r.Get("/readyz", observability.ReadinessHandler(observability.ReadinessConfig{
 		Timeout: deps.Config.Observability.ReadinessTimeout,
 		Checks:  readinessChecks,

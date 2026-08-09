@@ -45,6 +45,7 @@ func NewHandlerWithClientFactory(db *sql.DB, cfg config.AssetCatalogConfig, fact
 
 func RegisterRoutes(r chi.Router, h *Handler, authMiddleware func(http.Handler) http.Handler) {
 	r.Get("/api/assets/catalogs", h.ListCatalogs)
+	r.Get("/api/assets/catalogs/{code}/status", h.CatalogStatus)
 	r.Get("/api/assets/search", h.SearchAssets)
 	r.Get("/api/worlds/{id}/assets", h.ListWorldAssets)
 	r.Group(func(r chi.Router) {
@@ -52,6 +53,40 @@ func RegisterRoutes(r chi.Router, h *Handler, authMiddleware func(http.Handler) 
 		r.Post("/api/assets/resolve", h.ResolveAsset)
 		r.Post("/api/worlds/{id}/assets", h.AttachWorldAsset)
 		r.Delete("/api/worlds/{id}/assets/{assetRefId}", h.DetachWorldAsset)
+	})
+}
+
+func (h *Handler) CatalogStatus(w http.ResponseWriter, r *http.Request) {
+	catalog, err := h.loadCatalog(r.Context(), chi.URLParam(r, "code"))
+	if err != nil {
+		writeCatalogError(w, err, "catalog_status_failed")
+		return
+	}
+	checkedAt := time.Now().UTC()
+	if !catalog.Enabled {
+		httpx.WriteJSON(w, http.StatusServiceUnavailable, CatalogStatusResponse{
+			CatalogCode: catalog.Code, Status: "disabled", CheckedAt: checkedAt,
+		})
+		return
+	}
+	client, err := h.clientFactory.NewClient(catalog)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadGateway, "catalog_status_failed", err.Error())
+		return
+	}
+	checker, ok := client.(CatalogHealthChecker)
+	if !ok {
+		httpx.WriteError(w, http.StatusNotImplemented, "catalog_health_unsupported", "catalog connector does not expose a health check")
+		return
+	}
+	if err := checker.CheckHealth(r.Context()); err != nil {
+		httpx.WriteJSON(w, http.StatusServiceUnavailable, CatalogStatusResponse{
+			CatalogCode: catalog.Code, Status: "unavailable", CheckedAt: checkedAt,
+		})
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, CatalogStatusResponse{
+		CatalogCode: catalog.Code, Status: "available", CheckedAt: checkedAt,
 	})
 }
 

@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"basisvr-social-service/internal/auth"
 	"basisvr-social-service/internal/common/dbx"
 	"basisvr-social-service/internal/common/httpx"
+	"basisvr-social-service/internal/common/page"
 	"basisvr-social-service/internal/privacy"
 
 	"github.com/go-chi/chi/v5"
@@ -91,6 +93,16 @@ type activityPubLinks struct {
 
 const worldAccessTargetSQL = `SELECT owner_actor_id, visibility FROM worlds WHERE id = $1`
 
+const listWorldsSQL = `
+SELECT w.id, w.slug, w.name, w.description, w.preview_url, w.launch_url, w.visibility, w.capacity, w.tags, w.metadata,
+       a.id, a.acct, a.display_name, w.created_at
+FROM worlds w
+JOIN actors a ON a.id = w.owner_actor_id
+WHERE w.visibility = 'public'
+  AND ($1::timestamptz IS NULL OR (w.created_at, w.id) < ($1, $2))
+ORDER BY w.created_at DESC, w.id DESC
+LIMIT $3`
+
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	principal, err := auth.RequirePrincipal(r.Context())
 	if err != nil {
@@ -156,34 +168,54 @@ RETURNING id`,
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.db.QueryContext(r.Context(), `
-SELECT w.id, w.slug, w.name, w.description, w.preview_url, w.launch_url, w.visibility, w.capacity, w.tags, w.metadata,
-       a.id, a.acct, a.display_name
-FROM worlds w
-JOIN actors a ON a.id = w.owner_actor_id
-WHERE w.visibility = 'public'
-ORDER BY w.created_at DESC
-LIMIT 100`)
+	requestPage, err := page.ParseRequest(r, 24, 100)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_pagination", err.Error())
+		return
+	}
+	var cursorTime any
+	cursorID := uuid.Nil
+	if requestPage.Cursor != nil {
+		cursorTime = requestPage.Cursor.SortTime
+		cursorID = requestPage.Cursor.ID
+	}
+	rows, err := h.db.QueryContext(r.Context(), listWorldsSQL, cursorTime, cursorID, requestPage.Limit+1)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "list_worlds_failed", err.Error())
 		return
 	}
 	defer rows.Close()
 
-	worlds := []WorldResponse{}
+	type listedWorld struct {
+		world     WorldResponse
+		createdAt time.Time
+	}
+	listed := []listedWorld{}
 	for rows.Next() {
-		world, err := h.scanWorld(rows)
+		world, createdAt, err := h.scanListedWorld(rows)
 		if err != nil {
 			httpx.WriteError(w, http.StatusInternalServerError, "scan_world_failed", err.Error())
 			return
 		}
-		worlds = append(worlds, world)
+		listed = append(listed, listedWorld{world: world, createdAt: createdAt})
 	}
 	if err := rows.Err(); err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "list_worlds_failed", err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, worlds)
+	nextCursor := (*string)(nil)
+	if len(listed) > requestPage.Limit {
+		last := listed[requestPage.Limit-1]
+		nextCursor = page.NextCursor(page.Cursor{SortTime: last.createdAt, ID: last.world.ID})
+		listed = listed[:requestPage.Limit]
+	}
+	worlds := make([]WorldResponse, 0, len(listed))
+	for _, item := range listed {
+		worlds = append(worlds, item.world)
+	}
+	httpx.WriteJSON(w, http.StatusOK, page.Response[WorldResponse]{
+		Data: worlds, Pagination: page.Metadata{NextCursor: nextCursor, Limit: requestPage.Limit},
+	})
 }
 
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
@@ -462,6 +494,24 @@ func (h *Handler) scanWorld(row scanner) (WorldResponse, error) {
 	world.Metadata = dbx.DecodeJSON(metadataRaw, map[string]any{})
 	world.ActivityPub.ObjectURL = h.publicURL + "/objects/" + world.ID.String()
 	return world, nil
+}
+
+func (h *Handler) scanListedWorld(row scanner) (WorldResponse, time.Time, error) {
+	var world WorldResponse
+	var tags dbx.TextArray
+	var metadataRaw []byte
+	var createdAt time.Time
+	if err := row.Scan(
+		&world.ID, &world.Slug, &world.Name, &world.Description, &world.PreviewURL,
+		&world.LaunchURL, &world.Visibility, &world.Capacity, &tags, &metadataRaw,
+		&world.Owner.ActorID, &world.Owner.Acct, &world.Owner.DisplayName, &createdAt,
+	); err != nil {
+		return WorldResponse{}, time.Time{}, err
+	}
+	world.Tags = []string(tags)
+	world.Metadata = dbx.DecodeJSON(metadataRaw, map[string]any{})
+	world.ActivityPub.ObjectURL = h.publicURL + "/objects/" + world.ID.String()
+	return world, createdAt, nil
 }
 
 func parseUUIDParam(w http.ResponseWriter, r *http.Request, name string) (uuid.UUID, bool) {

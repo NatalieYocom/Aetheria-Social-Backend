@@ -11,16 +11,27 @@ import (
 	"github.com/google/uuid"
 )
 
-const expiredPresenceSelectSQL = `
-SELECT actor_id, visibility
-FROM presence_sessions
-WHERE expires_at <= now()
-ORDER BY expires_at ASC
-LIMIT $1`
-
-const expiredPresenceDeleteSQL = `
+const expiredPresenceDeleteBatchSQL = `
 DELETE FROM presence_sessions
-WHERE actor_id = $1 AND expires_at <= now()`
+WHERE id IN (
+  SELECT id
+  FROM presence_sessions
+  WHERE expires_at <= now()
+  ORDER BY expires_at ASC
+  LIMIT $1
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING actor_id, visibility, instance_id`
+
+const expireInstanceMemberSQL = `
+UPDATE instance_members
+SET state = 'left', left_at = now(), last_seen_at = now()
+WHERE instance_id = $1 AND actor_id = $2 AND state = 'joined'`
+
+const decrementInstanceUsersSQL = `
+UPDATE instances
+SET current_users = GREATEST(current_users - 1, 0)
+WHERE id = $1`
 
 type SweeperConfig struct {
 	Interval  time.Duration
@@ -37,6 +48,7 @@ type Sweeper struct {
 type expiredPresence struct {
 	actorID    uuid.UUID
 	visibility string
+	instanceID uuid.NullUUID
 }
 
 func NewSweeper(db *sql.DB, broker *realtime.Broker, config SweeperConfig) *Sweeper {
@@ -72,14 +84,25 @@ func (s *Sweeper) Run(ctx context.Context) {
 }
 
 func (s *Sweeper) SweepExpired(ctx context.Context) (int, error) {
-	rows, err := s.db.QueryContext(ctx, expiredPresenceSelectSQL, s.batch)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	rows, err := tx.QueryContext(ctx, expiredPresenceDeleteBatchSQL, s.batch)
 	if err != nil {
 		return 0, err
 	}
 	expired := []expiredPresence{}
 	for rows.Next() {
 		var item expiredPresence
-		if err := rows.Scan(&item.actorID, &item.visibility); err != nil {
+		if err := rows.Scan(&item.actorID, &item.visibility, &item.instanceID); err != nil {
 			_ = rows.Close()
 			return 0, err
 		}
@@ -92,20 +115,36 @@ func (s *Sweeper) SweepExpired(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
-	deleted := 0
+	changedInstances := map[uuid.UUID]struct{}{}
 	for _, item := range expired {
-		result, err := s.db.ExecContext(ctx, expiredPresenceDeleteSQL, item.actorID)
+		if !item.instanceID.Valid {
+			continue
+		}
+		result, err := tx.ExecContext(ctx, expireInstanceMemberSQL, item.instanceID.UUID, item.actorID)
 		if err != nil {
-			return deleted, err
+			return 0, err
 		}
 		affected, _ := result.RowsAffected()
 		if affected == 0 {
 			continue
 		}
-		deleted++
+		if _, err := tx.ExecContext(ctx, decrementInstanceUsersSQL, item.instanceID.UUID); err != nil {
+			return 0, err
+		}
+		changedInstances[item.instanceID.UUID] = struct{}{}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	committed = true
+
+	for _, item := range expired {
 		s.publishRemoval(ctx, item)
 	}
-	return deleted, nil
+	for instanceID := range changedInstances {
+		_ = realtime.PublishInstanceChanged(ctx, s.db, s.events, instanceID, "instance.updated")
+	}
+	return len(expired), nil
 }
 
 func (s *Sweeper) publishRemoval(ctx context.Context, item expiredPresence) {

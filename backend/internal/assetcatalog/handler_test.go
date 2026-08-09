@@ -18,6 +18,25 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestCatalogStatusReturnsAvailable(t *testing.T) {
+	db, mock := newMockDB(t)
+	catalogID := uuid.New()
+	mock.ExpectQuery(regexp.QuoteMeta(selectCatalogByCodeSQL)).
+		WithArgs("beeba").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "code", "name", "kind", "base_url", "api_base_url", "enabled", "metadata",
+		}).AddRow(catalogID, "beeba", "BeeBa", "beeba", "https://catalog.test", "https://catalog.test/api/v1", true, []byte(`{}`)))
+	router := newTestRouter(db, config.AssetCatalogConfig{}, healthClientFactory{client: healthyCatalogClient{}})
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/assets/catalogs/beeba/status", nil))
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"status":"available"`) {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestResolveAssetFetchesFromCatalogAndPersistsSnapshot(t *testing.T) {
 	db, mock := newMockDB(t)
 	catalogID := uuid.New()
@@ -375,6 +394,28 @@ type fakeCatalogClient struct {
 	asset      ResolvedAsset
 	searchPage SearchPage
 	err        error
+}
+
+type healthClientFactory struct {
+	client CatalogClient
+}
+
+func (f healthClientFactory) NewClient(_ Catalog) (CatalogClient, error) {
+	return f.client, nil
+}
+
+type healthyCatalogClient struct{}
+
+func (healthyCatalogClient) ResolveAsset(context.Context, string) (ResolvedAsset, error) {
+	return ResolvedAsset{}, nil
+}
+
+func (healthyCatalogClient) SearchAssets(context.Context, SearchQuery) (SearchPage, error) {
+	return SearchPage{}, nil
+}
+
+func (healthyCatalogClient) CheckHealth(context.Context) error {
+	return nil
 }
 
 func (c fakeCatalogClient) ResolveAsset(_ context.Context, _ string) (ResolvedAsset, error) {

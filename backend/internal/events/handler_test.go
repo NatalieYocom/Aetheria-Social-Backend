@@ -2,6 +2,7 @@ package events
 
 import (
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -10,11 +11,48 @@ import (
 	"time"
 
 	"basisvr-social-service/internal/auth"
+	"basisvr-social-service/internal/common/page"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )
+
+func TestListEventsReturnsCursorEnvelope(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newEventTestRouter(db, nil)
+	start := time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)
+	eventOne := uuid.New()
+	eventTwo := uuid.New()
+	worldID := uuid.New()
+	ownerID := uuid.New()
+
+	mock.ExpectQuery(regexp.QuoteMeta(listEventsSQL)).
+		WithArgs(nil, uuid.Nil, 2).
+		WillReturnRows(eventRows().
+			AddRow(eventOne, "one", "One", "", start, start.Add(time.Hour), "basis://one", "public", []byte(`{}`), ownerID, "owner@example.social", "Owner", worldID, "world", "World").
+			AddRow(eventTwo, "two", "Two", "", start.Add(time.Hour), start.Add(2*time.Hour), "basis://two", "public", []byte(`{}`), ownerID, "owner@example.social", "Owner", worldID, "world", "World"))
+
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/events?limit=1", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	var response page.Response[EventResponse]
+	if err := json.Unmarshal(res.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Data) != 1 || response.Pagination.NextCursor == nil {
+		t.Fatalf("response = %+v", response)
+	}
+	cursor, err := page.Decode(*response.Pagination.NextCursor)
+	if err != nil || cursor.ID != eventOne || !cursor.SortTime.Equal(start) {
+		t.Fatalf("cursor = %+v, err = %v", cursor, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestGetPrivateEventWithoutViewerReturnsNotFound(t *testing.T) {
 	db, mock := newMockDB(t)

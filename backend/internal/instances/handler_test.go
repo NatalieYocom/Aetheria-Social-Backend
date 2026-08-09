@@ -1,6 +1,7 @@
 package instances
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"basisvr-social-service/internal/auth"
+	"basisvr-social-service/internal/realtime"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/go-chi/chi/v5"
@@ -22,15 +24,25 @@ func TestJoinPublicInstanceCreatesMemberUpdatesCounterAndPresence(t *testing.T) 
 	instanceID := uuid.New()
 	worldID := uuid.New()
 	hostID := uuid.New()
+	previousInstanceID := uuid.New()
 	actorID := testPrincipal.ActorID
 
 	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(lockActorSQL)).
+		WithArgs(actorID).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(actorID))
 	mock.ExpectQuery(regexp.QuoteMeta(joinInstanceSelectSQL)).
 		WithArgs(instanceID).
 		WillReturnRows(joinInstanceRows().AddRow(instanceID, worldID, hostID, "public", 8, 0, "active", nil))
 	mock.ExpectQuery(regexp.QuoteMeta(joinedMemberExistsSQL)).
 		WithArgs(instanceID, actorID).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectQuery(regexp.QuoteMeta(leaveOtherInstancesSQL)).
+		WithArgs(actorID, instanceID).
+		WillReturnRows(sqlmock.NewRows([]string{"instance_id"}).AddRow(previousInstanceID))
+	mock.ExpectExec(regexp.QuoteMeta(decrementPreviousInstanceUsersSQL)).
+		WithArgs(previousInstanceID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("UPDATE instance_members").
 		WithArgs(instanceID, actorID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -71,6 +83,9 @@ func TestJoinFullInstanceRejectsNewParticipant(t *testing.T) {
 	actorID := testPrincipal.ActorID
 
 	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(lockActorSQL)).
+		WithArgs(actorID).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(actorID))
 	mock.ExpectQuery(regexp.QuoteMeta(joinInstanceSelectSQL)).
 		WithArgs(instanceID).
 		WillReturnRows(joinInstanceRows().AddRow(instanceID, worldID, hostID, "public", 1, 1, "active", nil))
@@ -274,6 +289,75 @@ func TestCreateInstanceInPrivateWorldWithoutAccessReturnsNotFound(t *testing.T) 
 	}
 }
 
+func TestCreateInstanceRejectsInvalidVisibility(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newTestRouter(db)
+	worldID := uuid.New()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/instances", strings.NewReader(`{"worldId":"`+worldID.String()+`","visibility":"secret"}`))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+
+	router.ServeHTTP(res, req)
+
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	if !strings.Contains(res.Body.String(), `"code":"invalid_visibility"`) {
+		t.Fatalf("body = %s", res.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCloseInstanceClearsMembersPresenceAndCounter(t *testing.T) {
+	db, mock := newMockDB(t)
+	broker := realtime.NewBroker(realtime.BrokerConfig{BufferSize: 4})
+	router := newTestRouterWithBroker(db, broker)
+	instanceID := uuid.New()
+	memberID := uuid.New()
+	events, unsubscribe := broker.Subscribe(context.Background(), memberID)
+	defer unsubscribe()
+
+	mock.ExpectQuery("SELECT EXISTS.*FROM instances").
+		WithArgs(instanceID, testPrincipal.ActorID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectBegin()
+	mock.ExpectExec("UPDATE instances").
+		WithArgs(instanceID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE instance_members").
+		WithArgs(instanceID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("DELETE FROM presence_sessions").
+		WithArgs(instanceID).
+		WillReturnRows(sqlmock.NewRows([]string{"actor_id", "visibility"}).AddRow(memberID, "nobody"))
+	mock.ExpectCommit()
+	mock.ExpectQuery("SELECT host_actor_id AS actor_id").
+		WithArgs(instanceID).
+		WillReturnRows(sqlmock.NewRows([]string{"actor_id"}))
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/instances/"+instanceID.String(), nil)
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+
+	if res.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	select {
+	case event := <-events:
+		if event.Type != "presence.removed" {
+			t.Fatalf("event.Type = %q", event.Type)
+		}
+	default:
+		t.Fatal("expected presence.removed event")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func newMockDB(t *testing.T) (*sql.DB, sqlmock.Sqlmock) {
 	t.Helper()
 	db, mock, err := sqlmock.New()
@@ -293,8 +377,12 @@ var testPrincipal = auth.Principal{
 }
 
 func newTestRouter(db *sql.DB) http.Handler {
+	return newTestRouterWithBroker(db, nil)
+}
+
+func newTestRouterWithBroker(db *sql.DB, broker *realtime.Broker) http.Handler {
 	r := chi.NewRouter()
-	RegisterRoutes(r, NewHandler(db), func(next http.Handler) http.Handler {
+	RegisterRoutes(r, NewHandler(db, broker), func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			next.ServeHTTP(w, r.WithContext(auth.ContextWithPrincipal(r.Context(), testPrincipal)))
 		})

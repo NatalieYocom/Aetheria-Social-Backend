@@ -1,0 +1,210 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Basis Social API",
+    "version": "1.0.0-alpha",
+    "description": "Stable REST and world-server integration contract for BasisVR. ActivityPub endpoints are intentionally outside this client API contract."
+  },
+  "servers": [{"url": "/"}],
+  "tags": [
+    {"name": "Auth"}, {"name": "Profiles"}, {"name": "Relationships"},
+    {"name": "Worlds"}, {"name": "Events"}, {"name": "Instances"},
+    {"name": "WorldServer"}, {"name": "Presence"}, {"name": "Invites"},
+    {"name": "Notifications"}, {"name": "Assets"}, {"name": "Moderation"},
+    {"name": "Realtime"}
+  ],
+  "paths": {
+    "/api/v1/auth/register": {"post": {"tags":["Auth"],"operationId":"register","requestBody":{"$ref":"#/components/requestBodies/Register"},"responses":{"201":{"description":"Registered","content":{"application/json":{"schema":{"$ref":"#/components/schemas/AuthSession"}}}},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/auth/login": {"post": {"tags":["Auth"],"operationId":"login","requestBody":{"$ref":"#/components/requestBodies/Login"},"responses":{"200":{"description":"Authenticated","content":{"application/json":{"schema":{"$ref":"#/components/schemas/AuthSession"}}}},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/auth/refresh": {"post": {"tags":["Auth"],"operationId":"refreshSession","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","required":["refreshToken"],"properties":{"refreshToken":{"type":"string"}}}}}},"responses":{"200":{"description":"Refreshed","content":{"application/json":{"schema":{"$ref":"#/components/schemas/AuthSession"}}}},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/auth/logout": {"post": {"tags":["Auth"],"operationId":"logout","security":[{"bearerAuth":[]}],"responses":{"204":{"description":"Logged out"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/me": {"get": {"tags":["Profiles"],"operationId":"getCurrentUser","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Current user","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Profile"}}}},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/me/profile": {"patch": {"tags":["Profiles"],"operationId":"updateCurrentProfile","security":[{"bearerAuth":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ProfileUpdate"}}}},"responses":{"200":{"description":"Updated profile","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Profile"}}}},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/users/{username}": {"get": {"tags":["Profiles"],"operationId":"getUser","parameters":[{"$ref":"#/components/parameters/Username"}],"responses":{"200":{"description":"Public profile","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Profile"}}}},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/search/users": {"get": {"tags":["Profiles"],"operationId":"searchUsers","parameters":[{"name":"q","in":"query","required":true,"schema":{"type":"string","maxLength":200}}],"responses":{"200":{"description":"Matching users","content":{"application/json":{"schema":{"type":"array","items":{"$ref":"#/components/schemas/Profile"}}}}},"default":{"$ref":"#/components/responses/Error"}}}},
+
+    "/api/v1/relationships/follow": {"$ref":"#/components/pathItems/RelationshipMutation"},
+    "/api/v1/relationships/unfollow": {"$ref":"#/components/pathItems/RelationshipMutation"},
+    "/api/v1/friends/request": {"$ref":"#/components/pathItems/RelationshipMutation"},
+    "/api/v1/friends/accept": {"$ref":"#/components/pathItems/RelationshipMutation"},
+    "/api/v1/friends/reject": {"$ref":"#/components/pathItems/RelationshipMutation"},
+    "/api/v1/friends": {"$ref":"#/components/pathItems/RelationshipList"},
+    "/api/v1/followers": {"$ref":"#/components/pathItems/RelationshipList"},
+    "/api/v1/following": {"$ref":"#/components/pathItems/RelationshipList"},
+    "/api/v1/users/{id}/block": {"post": {"tags":["Relationships"],"operationId":"blockUser","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"200":{"description":"Blocked"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/users/{id}/unblock": {"post": {"tags":["Relationships"],"operationId":"unblockUser","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"200":{"description":"Unblocked"},"default":{"$ref":"#/components/responses/Error"}}}},
+
+    "/api/v1/worlds": {
+      "get": {"tags":["Worlds"],"operationId":"listWorlds","parameters":[{"$ref":"#/components/parameters/Limit"},{"$ref":"#/components/parameters/Cursor"}],"responses":{"200":{"description":"Cursor page of public worlds","content":{"application/json":{"schema":{"$ref":"#/components/schemas/WorldPage"}}}},"default":{"$ref":"#/components/responses/Error"}}},
+      "post": {"tags":["Worlds"],"operationId":"createWorld","security":[{"bearerAuth":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/WorldWrite"}}}},"responses":{"201":{"description":"Created world","content":{"application/json":{"schema":{"$ref":"#/components/schemas/World"}}}},"default":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/v1/worlds/{worldRef}": {"get": {"tags":["Worlds"],"operationId":"getWorld","parameters":[{"$ref":"#/components/parameters/WorldRef"}],"responses":{"200":{"description":"World; GET resolves worldRef as slug.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/World"}}}},"default":{"$ref":"#/components/responses/Error"}}},"patch": {"tags":["Worlds"],"operationId":"updateWorld","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/WorldRef"}],"responses":{"200":{"description":"Updated world; PATCH resolves worldRef as UUID."},"default":{"$ref":"#/components/responses/Error"}}},"delete":{"tags":["Worlds"],"operationId":"deleteWorld","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/WorldRef"}],"responses":{"204":{"description":"Deleted; DELETE resolves worldRef as UUID."},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/worlds/{id}/favorite": {"post": {"tags":["Worlds"],"operationId":"favoriteWorld","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"200":{"description":"Favorited"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/worlds/{id}/announce": {"post": {"tags":["Worlds"],"operationId":"announceWorld","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"202":{"description":"Announcement accepted"},"default":{"$ref":"#/components/responses/Error"}}}},
+
+    "/api/v1/events": {
+      "get": {"tags":["Events"],"operationId":"listEvents","parameters":[{"$ref":"#/components/parameters/Limit"},{"$ref":"#/components/parameters/Cursor"}],"responses":{"200":{"description":"Cursor page of public events","content":{"application/json":{"schema":{"$ref":"#/components/schemas/EventPage"}}}},"default":{"$ref":"#/components/responses/Error"}}},
+      "post": {"tags":["Events"],"operationId":"createEvent","security":[{"bearerAuth":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/EventWrite"}}}},"responses":{"201":{"description":"Created event","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Event"}}}},"default":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/v1/events/{eventRef}": {"get": {"tags":["Events"],"operationId":"getEvent","parameters":[{"$ref":"#/components/parameters/EventRef"}],"responses":{"200":{"description":"Event; GET resolves eventRef as slug.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Event"}}}},"default":{"$ref":"#/components/responses/Error"}}},"patch": {"tags":["Events"],"operationId":"updateEvent","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/EventRef"}],"responses":{"200":{"description":"Updated event; PATCH resolves eventRef as UUID."},"default":{"$ref":"#/components/responses/Error"}}},"delete":{"tags":["Events"],"operationId":"deleteEvent","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/EventRef"}],"responses":{"204":{"description":"Deleted; DELETE resolves eventRef as UUID."},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/events/{id}/rsvp": {"post": {"tags":["Events"],"operationId":"rsvpEvent","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"200":{"description":"RSVP updated"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/events/{id}/announce": {"post": {"tags":["Events"],"operationId":"announceEvent","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"202":{"description":"Announcement accepted"},"default":{"$ref":"#/components/responses/Error"}}}},
+
+    "/api/v1/instances": {"post": {"tags":["Instances"],"operationId":"createInstance","security":[{"bearerAuth":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/InstanceWrite"}}}},"responses":{"201":{"description":"Created instance","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Instance"}}}},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/instances/{id}": {"get":{"tags":["Instances"],"operationId":"getInstance","parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"200":{"description":"Instance","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Instance"}}}},"default":{"$ref":"#/components/responses/Error"}}},"patch":{"tags":["Instances"],"operationId":"updateInstance","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"200":{"description":"Updated"},"default":{"$ref":"#/components/responses/Error"}}},"delete":{"tags":["Instances"],"operationId":"closeInstance","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"204":{"description":"Closed"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/worlds/{id}/instances": {"get": {"tags":["Instances"],"operationId":"listWorldInstances","parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"200":{"description":"Visible active instances","content":{"application/json":{"schema":{"type":"array","items":{"$ref":"#/components/schemas/Instance"}}}}},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/instances/{id}/join-tickets": {"post": {"tags":["Instances"],"operationId":"issueJoinTicket","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/JoinPreferences"}}}},"responses":{"201":{"description":"One-time ticket","content":{"application/json":{"schema":{"$ref":"#/components/schemas/JoinTicket"}}}},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/instances/{id}/join": {"post": {"tags":["Instances"],"operationId":"joinInstanceLegacy","deprecated":true,"security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"200":{"description":"Joined"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/instances/{id}/heartbeat": {"post": {"tags":["Instances"],"operationId":"heartbeatInstanceLegacy","deprecated":true,"security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"200":{"description":"Presence refreshed"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/instances/{id}/leave": {"post": {"tags":["Instances"],"operationId":"leaveInstanceLegacy","deprecated":true,"security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"204":{"description":"Left"},"default":{"$ref":"#/components/responses/Error"}}}},
+
+    "/api/v1/service/instance-join-tickets/consume": {"post": {"tags":["WorldServer"],"operationId":"consumeJoinTicket","security":[{"serviceToken":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","required":["ticket"],"properties":{"ticket":{"type":"string","pattern":"^bvr_jt_"}}}}}},"responses":{"200":{"description":"Actor admitted","content":{"application/json":{"schema":{"$ref":"#/components/schemas/JoinAdmission"}}}},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/service/instances/{id}/heartbeat": {"post": {"tags":["WorldServer"],"operationId":"heartbeatWorldServerInstance","security":[{"serviceToken":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"ttlSeconds":{"type":"integer","minimum":30,"maximum":300,"default":90}}}}}},"responses":{"200":{"description":"Lease renewed","content":{"application/json":{"schema":{"$ref":"#/components/schemas/InstanceLease"}}}},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/service/instances/{id}/members/{actorId}/heartbeat": {"post": {"tags":["WorldServer"],"operationId":"heartbeatInstanceMember","security":[{"serviceToken":[]}],"parameters":[{"$ref":"#/components/parameters/ID"},{"$ref":"#/components/parameters/ActorID"}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/JoinPreferences"}}}},"responses":{"200":{"description":"Member presence refreshed"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/service/instances/{id}/members/{actorId}": {"delete": {"tags":["WorldServer"],"operationId":"removeInstanceMember","security":[{"serviceToken":[]}],"parameters":[{"$ref":"#/components/parameters/ID"},{"$ref":"#/components/parameters/ActorID"}],"responses":{"204":{"description":"Member removed"},"default":{"$ref":"#/components/responses/Error"}}}},
+
+    "/api/v1/invites": {"get":{"tags":["Invites"],"operationId":"listInvites","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Invites"},"default":{"$ref":"#/components/responses/Error"}}},"post":{"tags":["Invites"],"operationId":"createInvite","security":[{"bearerAuth":[]}],"responses":{"201":{"description":"Created invite"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/invites/{id}/accept": {"post":{"tags":["Invites"],"operationId":"acceptInvite","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"200":{"description":"Accepted"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/invites/{id}/decline": {"post":{"tags":["Invites"],"operationId":"declineInvite","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"200":{"description":"Declined"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/presence": {"post":{"tags":["Presence"],"operationId":"upsertPresence","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Presence updated"},"default":{"$ref":"#/components/responses/Error"}}},"delete":{"tags":["Presence"],"operationId":"deletePresence","security":[{"bearerAuth":[]}],"responses":{"204":{"description":"Presence removed"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/presence/me": {"get":{"tags":["Presence"],"operationId":"getMyPresence","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Own presence"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/presence/friends": {"get":{"tags":["Presence"],"operationId":"listFriendPresence","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Visible friend presence"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/notifications": {"get":{"tags":["Notifications"],"operationId":"listNotifications","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Notifications"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/notifications/unread-count": {"get":{"tags":["Notifications"],"operationId":"getUnreadNotificationCount","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Unread count"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/notifications/{id}/read": {"post":{"tags":["Notifications"],"operationId":"markNotificationRead","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"200":{"description":"Marked read"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/notifications/read-all": {"post":{"tags":["Notifications"],"operationId":"markAllNotificationsRead","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Marked read"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/realtime/events": {"get":{"tags":["Realtime"],"operationId":"streamRealtimeEvents","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Server-Sent Events stream","content":{"text/event-stream":{"schema":{"type":"string"}}}},"default":{"$ref":"#/components/responses/Error"}}}},
+
+    "/api/v1/assets/catalogs": {"get":{"tags":["Assets"],"operationId":"listAssetCatalogs","responses":{"200":{"description":"Configured catalogs","content":{"application/json":{"schema":{"type":"array","items":{"$ref":"#/components/schemas/Catalog"}}}}},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/assets/catalogs/{code}/status": {"get":{"tags":["Assets"],"operationId":"getAssetCatalogStatus","parameters":[{"name":"code","in":"path","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"Catalog is available"},"503":{"description":"Catalog is disabled or unavailable"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/assets/search": {"get":{"tags":["Assets"],"operationId":"searchAssets","parameters":[{"name":"catalog","in":"query","schema":{"type":"string","default":"beeba"}},{"name":"q","in":"query","schema":{"type":"string"}},{"name":"type","in":"query","schema":{"type":"string"}},{"name":"tags","in":"query","schema":{"type":"string"}},{"name":"includeNsfw","in":"query","schema":{"type":"boolean","default":false}},{"name":"sort","in":"query","schema":{"type":"string","enum":["newest","likes","downloads"]}},{"$ref":"#/components/parameters/Limit"},{"$ref":"#/components/parameters/Cursor"}],"responses":{"200":{"description":"Normalized BeeBa search page","content":{"application/json":{"schema":{"$ref":"#/components/schemas/AssetSearchPage"}}}},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/assets/resolve": {"post":{"tags":["Assets"],"operationId":"resolveAsset","security":[{"bearerAuth":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","required":["catalog","externalId"],"properties":{"catalog":{"type":"string"},"externalId":{"type":"string"}}}}}},"responses":{"200":{"description":"Resolved snapshot","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Asset"}}}},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/worlds/{id}/assets": {"get":{"tags":["Assets"],"operationId":"listWorldAssets","parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"200":{"description":"World asset references"},"default":{"$ref":"#/components/responses/Error"}}},"post":{"tags":["Assets"],"operationId":"attachWorldAsset","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"}],"responses":{"200":{"description":"Attached assets"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/worlds/{id}/assets/{assetRefId}": {"delete":{"tags":["Assets"],"operationId":"detachWorldAsset","security":[{"bearerAuth":[]}],"parameters":[{"$ref":"#/components/parameters/ID"},{"name":"assetRefId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"responses":{"204":{"description":"Detached"},"default":{"$ref":"#/components/responses/Error"}}}},
+
+    "/api/v1/reports": {"post":{"tags":["Moderation"],"operationId":"createReport","security":[{"bearerAuth":[]}],"responses":{"201":{"description":"Report created"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/me/reports": {"get":{"tags":["Moderation"],"operationId":"listMyReports","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Own reports"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/admin/world-server-credentials": {"get":{"tags":["WorldServer"],"operationId":"listWorldServerCredentials","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Credentials"},"default":{"$ref":"#/components/responses/Error"}}},"post":{"tags":["WorldServer"],"operationId":"createWorldServerCredential","security":[{"bearerAuth":[]}],"responses":{"201":{"description":"Credential with one-time secret"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/admin/world-server-credentials/{credentialId}": {"delete":{"tags":["WorldServer"],"operationId":"revokeWorldServerCredential","security":[{"bearerAuth":[]}],"parameters":[{"name":"credentialId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"responses":{"204":{"description":"Revoked"},"default":{"$ref":"#/components/responses/Error"}}}},
+    "/api/v1/admin/instance-join-audit": {"get":{"tags":["WorldServer"],"operationId":"listInstanceJoinAudit","security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Admission audit"},"default":{"$ref":"#/components/responses/Error"}}}}
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {"type":"http","scheme":"bearer","bearerFormat":"JWT"},
+      "serviceToken": {"type":"apiKey","in":"header","name":"X-Basis-Service-Token"}
+    },
+    "parameters": {
+      "ID": {"name":"id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}},
+      "ActorID": {"name":"actorId","in":"path","required":true,"schema":{"type":"string","format":"uuid"}},
+      "Username": {"name":"username","in":"path","required":true,"schema":{"type":"string"}},
+      "Slug": {"name":"slug","in":"path","required":true,"schema":{"type":"string"}},
+      "WorldRef": {"name":"worldRef","in":"path","required":true,"schema":{"type":"string"}},
+      "EventRef": {"name":"eventRef","in":"path","required":true,"schema":{"type":"string"}},
+      "Limit": {"name":"limit","in":"query","schema":{"type":"integer","minimum":1,"maximum":100,"default":24}},
+      "Cursor": {"name":"cursor","in":"query","description":"Opaque cursor returned by the previous page.","schema":{"type":"string"}}
+    },
+    "responses": {
+      "Error": {"description":"Error response","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}
+    },
+    "requestBodies": {
+      "Register": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": ["username", "email", "password"],
+              "properties": {
+                "username": {"type": "string"},
+                "email": {"type": "string", "format": "email"},
+                "password": {"type": "string", "format": "password"}
+              }
+            }
+          }
+        }
+      },
+      "Login": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": ["login", "password"],
+              "properties": {
+                "login": {"type": "string"},
+                "password": {"type": "string", "format": "password"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "pathItems": {
+      "RelationshipMutation": {
+        "post": {
+          "tags": ["Relationships"],
+          "security": [{"bearerAuth": []}],
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "targetActorId": {"type": "string", "format": "uuid"},
+                    "targetAcct": {"type": "string"}
+                  }
+                }
+              }
+            }
+          },
+          "responses": {
+            "200": {"description": "Relationship updated"},
+            "default": {"$ref": "#/components/responses/Error"}
+          }
+        }
+      },
+      "RelationshipList": {
+        "get": {
+          "tags": ["Relationships"],
+          "security": [{"bearerAuth": []}],
+          "responses": {
+            "200": {
+              "description": "Actors",
+              "content": {
+                "application/json": {
+                  "schema": {"type": "array", "items": {"$ref": "#/components/schemas/ActorSummary"}}
+                }
+              }
+            },
+            "default": {"$ref": "#/components/responses/Error"}
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Error": {"type":"object","required":["error"],"properties":{"error":{"type":"object","required":["code","message"],"properties":{"code":{"type":"string"},"message":{"type":"string"}}}}},
+      "AuthSession": {"type":"object","required":["accessToken","refreshToken"],"properties":{"accessToken":{"type":"string"},"refreshToken":{"type":"string"},"user":{"$ref":"#/components/schemas/Profile"}}},
+      "Profile": {"type":"object","properties":{"id":{"type":"string","format":"uuid"},"actorId":{"type":"string","format":"uuid"},"username":{"type":"string"},"acct":{"type":"string"},"displayName":{"type":"string"},"bio":{"type":"string"},"avatarUrl":{"type":"string"},"bannerUrl":{"type":"string"},"statusText":{"type":"string"},"links":{"type":"array","items":{}},"relationship":{"type":"object"}}},
+      "ProfileUpdate": {"type":"object","properties":{"displayName":{"type":"string"},"bio":{"type":"string"},"avatarUrl":{"type":"string"},"bannerUrl":{"type":"string"},"statusText":{"type":"string"},"links":{"type":"array","items":{}},"privacySettings":{"type":"object"}}},
+      "ActorSummary": {"type":"object","properties":{"actorId":{"type":"string","format":"uuid"},"acct":{"type":"string"},"username":{"type":"string"},"displayName":{"type":"string"},"avatarUrl":{"type":"string"}}},
+      "Owner": {"type":"object","required":["actorId","acct","displayName"],"properties":{"actorId":{"type":"string","format":"uuid"},"acct":{"type":"string"},"displayName":{"type":"string"}}},
+      "Pagination": {"type":"object","required":["nextCursor","limit"],"properties":{"nextCursor":{"type":["string","null"]},"limit":{"type":"integer","minimum":1,"maximum":100}}},
+      "World": {"type":"object","required":["id","slug","name","owner","visibility","capacity","tags","metadata"],"properties":{"id":{"type":"string","format":"uuid"},"slug":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"owner":{"$ref":"#/components/schemas/Owner"},"previewUrl":{"type":"string"},"launchUrl":{"type":"string"},"visibility":{"type":"string","enum":["public","followers","friends","private"]},"capacity":{"type":"integer","minimum":0},"tags":{"type":"array","items":{"type":"string"}},"metadata":{"type":"object"},"activityPub":{"type":"object"}}},
+      "WorldWrite": {"type":"object","required":["name"],"properties":{"slug":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"previewUrl":{"type":"string"},"launchUrl":{"type":"string"},"visibility":{"type":"string"},"capacity":{"type":"integer","minimum":0},"tags":{"type":"array","items":{"type":"string"}},"metadata":{"type":"object"}}},
+      "WorldPage": {"type":"object","required":["data","pagination"],"properties":{"data":{"type":"array","items":{"$ref":"#/components/schemas/World"}},"pagination":{"$ref":"#/components/schemas/Pagination"}}},
+      "Event": {"type":"object","required":["id","slug","name","owner","world","startTime","endTime","visibility"],"properties":{"id":{"type":"string","format":"uuid"},"slug":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"owner":{"$ref":"#/components/schemas/Owner"},"world":{"type":"object"},"startTime":{"type":"string","format":"date-time"},"endTime":{"type":"string","format":"date-time"},"launchUrl":{"type":"string"},"visibility":{"type":"string"},"metadata":{"type":"object"}}},
+      "EventWrite": {"type":"object","required":["worldId","name","startTime","endTime"],"properties":{"worldId":{"type":"string","format":"uuid"},"slug":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"startTime":{"type":"string","format":"date-time"},"endTime":{"type":"string","format":"date-time"},"visibility":{"type":"string"},"launchUrl":{"type":"string"},"metadata":{"type":"object"}}},
+      "EventPage": {"type":"object","required":["data","pagination"],"properties":{"data":{"type":"array","items":{"$ref":"#/components/schemas/Event"}},"pagination":{"$ref":"#/components/schemas/Pagination"}}},
+      "Instance": {"type":"object","required":["id","worldId","hostActorId","instanceKey","capacity","currentUsers","status"],"properties":{"id":{"type":"string","format":"uuid"},"worldId":{"type":"string","format":"uuid"},"hostActorId":{"type":"string","format":"uuid"},"instanceKey":{"type":"string"},"name":{"type":"string"},"visibility":{"type":"string","enum":["public","friends","invite_only","private"]},"launchUrl":{"type":"string"},"capacity":{"type":"integer","minimum":0},"currentUsers":{"type":"integer","minimum":0,"readOnly":true},"status":{"type":"string","enum":["active","closed","expired"],"readOnly":true},"expiresAt":{"type":["string","null"],"format":"date-time"},"metadata":{"type":"object"}}},
+      "InstanceWrite": {"type":"object","required":["worldId"],"properties":{"worldId":{"type":"string","format":"uuid"},"instanceKey":{"type":"string"},"name":{"type":"string"},"visibility":{"type":"string"},"launchUrl":{"type":"string"},"capacity":{"type":"integer","minimum":0},"expiresAt":{"type":"string","format":"date-time"},"metadata":{"type":"object"}}},
+      "JoinPreferences": {"type":"object","properties":{"status":{"type":"string","enum":["online","away","busy","invisible"]},"presenceVisibility":{"type":"string","enum":["nobody","friends","followers","public"],"default":"friends"},"showExactInstance":{"type":"boolean","default":false},"metadata":{"type":"object"}}},
+      "JoinTicket": {"type":"object","required":["ticket","expiresAt","instance"],"properties":{"ticket":{"type":"string","pattern":"^bvr_jt_"},"expiresAt":{"type":"string","format":"date-time"},"instance":{"$ref":"#/components/schemas/Instance"}}},
+      "JoinAdmission": {"type":"object","required":["state","actorId","acct","presenceExpiresAt","instance"],"properties":{"state":{"const":"joined"},"actorId":{"type":"string","format":"uuid"},"acct":{"type":"string"},"presenceExpiresAt":{"type":"string","format":"date-time"},"instance":{"$ref":"#/components/schemas/Instance"}}},
+      "InstanceLease": {"type":"object","required":["state","expiresAt","serverTime","credentialId"],"properties":{"state":{"const":"active"},"expiresAt":{"type":"string","format":"date-time"},"serverTime":{"type":"string","format":"date-time"},"credentialId":{"type":"string","format":"uuid"}}},
+      "Catalog": {"type":"object","properties":{"id":{"type":"string","format":"uuid"},"code":{"type":"string"},"name":{"type":"string"},"kind":{"type":"string"},"baseUrl":{"type":"string"},"apiBaseUrl":{"type":"string"},"enabled":{"type":"boolean"},"metadata":{"type":"object"}}},
+      "Asset": {"type":"object","properties":{"id":{"type":"string","format":"uuid"},"externalId":{"type":"string"},"externalUrl":{"type":"string"},"contentType":{"type":"string"},"title":{"type":"string"},"description":{"type":"string"},"previewUrl":{"type":"string"},"downloadUrl":{"type":"string"},"authorName":{"type":"string"},"license":{"type":"string"},"nsfw":{"type":"boolean"},"tags":{"type":"array","items":{"type":"string"}},"metadata":{"type":"object"}}},
+      "AssetSearchPage": {"type":"object","required":["catalog","items","nextCursor"],"properties":{"catalog":{"$ref":"#/components/schemas/Catalog"},"items":{"type":"array","items":{"$ref":"#/components/schemas/Asset"}},"nextCursor":{"type":"string"}}}
+    }
+  }
+}
