@@ -3,13 +3,13 @@ package events
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"regexp"
 	"strings"
 	"time"
 
+	activityoutbox "basisvr-social-service/internal/activitypub/outbox"
 	"basisvr-social-service/internal/auth"
 	"basisvr-social-service/internal/common/dbx"
 	"basisvr-social-service/internal/common/httpx"
@@ -23,10 +23,12 @@ import (
 type Handler struct {
 	db        *sql.DB
 	publicURL string
+	outbox    *activityoutbox.Service
 }
 
 func NewHandler(db *sql.DB, publicURL string) *Handler {
-	return &Handler{db: db, publicURL: strings.TrimRight(publicURL, "/")}
+	publicURL = strings.TrimRight(publicURL, "/")
+	return &Handler{db: db, publicURL: publicURL, outbox: activityoutbox.NewService(db, publicURL)}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler, authMiddleware func(http.Handler) http.Handler) {
@@ -105,8 +107,13 @@ SELECT e.id, e.slug, e.name, e.description, e.start_time, e.end_time, e.launch_u
        w.id, w.slug, w.name
 FROM events e
 JOIN actors a ON a.id = e.owner_actor_id
+LEFT JOIN users event_owner_user ON event_owner_user.id = a.local_user_id
 JOIN worlds w ON w.id = e.world_id
+JOIN actors world_owner ON world_owner.id = w.owner_actor_id
+LEFT JOIN users world_owner_user ON world_owner_user.id = world_owner.local_user_id
 WHERE e.visibility = 'public'
+  AND (a.local_user_id IS NULL OR event_owner_user.status = 'active')
+  AND (world_owner.local_user_id IS NULL OR world_owner_user.status = 'active')
   AND ($1::timestamptz IS NULL OR (e.start_time, e.id) > ($1, $2))
 ORDER BY e.start_time ASC, e.id ASC
 LIMIT $3`
@@ -404,20 +411,17 @@ func (h *Handler) Announce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	activityURI := h.publicURL + "/activities/" + uuid.NewString()
-	raw, _ := json.Marshal(map[string]any{
-		"type":   "Announce",
-		"actor":  principal.ActorID.String(),
-		"object": h.publicURL + "/events/" + event.Slug,
+	result, err := h.outbox.PublishAnnounce(r.Context(), activityoutbox.AnnounceInput{
+		ActorID: principal.ActorID, ObjectID: event.ID, ObjectType: "Event",
+		ObjectURI: h.publicURL + "/objects/" + event.ID.String(), Visibility: event.Visibility,
 	})
-	if _, err := h.db.ExecContext(r.Context(), `
-INSERT INTO activities (activity_uri, actor_id, type, object_id, object_type, visibility, raw_json, direction)
-VALUES ($1, $2, 'Announce', $3, 'Event', $4, $5, 'local')`,
-		activityURI, principal.ActorID, event.ID, event.Visibility, raw); err != nil {
+	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "announce_event_failed", err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusAccepted, map[string]any{"activityUri": activityURI})
+	httpx.WriteJSON(w, http.StatusAccepted, map[string]any{
+		"activityUri": result.ActivityURI, "federationDeliveries": result.Deliveries,
+	})
 }
 
 func (h *Handler) requireOwnerTarget(w http.ResponseWriter, r *http.Request) (auth.Principal, uuid.UUID, bool) {
@@ -482,12 +486,16 @@ func writeEventNotFound(w http.ResponseWriter) {
 }
 
 func (h *Handler) loadByID(ctx context.Context, id uuid.UUID) (EventResponse, error) {
-	row := h.db.QueryRowContext(ctx, eventQuery()+` WHERE e.id = $1`, id)
+	row := h.db.QueryRowContext(ctx, eventQuery()+` WHERE e.id = $1
+  AND (a.local_user_id IS NULL OR event_owner_user.status = 'active')
+  AND (world_owner.local_user_id IS NULL OR world_owner_user.status = 'active')`, id)
 	return h.scanEvent(row)
 }
 
 func (h *Handler) loadBySlug(ctx context.Context, slug string) (EventResponse, error) {
-	row := h.db.QueryRowContext(ctx, eventQuery()+` WHERE e.slug = $1`, strings.ToLower(strings.TrimSpace(slug)))
+	row := h.db.QueryRowContext(ctx, eventQuery()+` WHERE e.slug = $1
+  AND (a.local_user_id IS NULL OR event_owner_user.status = 'active')
+  AND (world_owner.local_user_id IS NULL OR world_owner_user.status = 'active')`, strings.ToLower(strings.TrimSpace(slug)))
 	return h.scanEvent(row)
 }
 
@@ -498,7 +506,10 @@ SELECT e.id, e.slug, e.name, e.description, e.start_time, e.end_time, e.launch_u
        w.id, w.slug, w.name
 FROM events e
 JOIN actors a ON a.id = e.owner_actor_id
-JOIN worlds w ON w.id = e.world_id`
+LEFT JOIN users event_owner_user ON event_owner_user.id = a.local_user_id
+JOIN worlds w ON w.id = e.world_id
+JOIN actors world_owner ON world_owner.id = w.owner_actor_id
+LEFT JOIN users world_owner_user ON world_owner_user.id = world_owner.local_user_id`
 }
 
 type scanner interface {

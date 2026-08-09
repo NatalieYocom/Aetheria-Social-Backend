@@ -3,6 +3,7 @@ package relationships
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,12 +11,45 @@ import (
 	"time"
 
 	"basisvr-social-service/internal/auth"
+	"basisvr-social-service/internal/common/page"
 	"basisvr-social-service/internal/realtime"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )
+
+func TestFriendsReturnsCursorEnvelope(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newTestRouter(db, nil)
+	firstActorID := uuid.New()
+
+	mock.ExpectQuery("FROM relationships rel").
+		WithArgs(testPrincipal.ActorID, "friend", "accepted", nil, nil, uuid.Nil, 2).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "acct", "preferred_username", "display_name", "avatar_url"}).
+			AddRow(firstActorID, "alice@example.social", "alice", "Alice", "").
+			AddRow(uuid.New(), "bob@example.social", "bob", "Bob", ""))
+
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/friends?limit=1", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	var response page.Response[actorSummary]
+	if err := json.Unmarshal(res.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Data) != 1 || response.Pagination.NextCursor == nil {
+		t.Fatalf("response = %+v", response)
+	}
+	cursor, err := page.DecodeText(*response.Pagination.NextCursor)
+	if err != nil || cursor.ID != firstActorID || cursor.SortText != "alice@example.social" {
+		t.Fatalf("cursor = %+v, err = %v", cursor, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestFriendRequestCreatesDurableNotification(t *testing.T) {
 	db, mock := newMockDB(t)

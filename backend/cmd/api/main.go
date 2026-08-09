@@ -10,13 +10,29 @@ import (
 	"syscall"
 	"time"
 
+	"basisvr-social-service/internal/activitypub"
 	"basisvr-social-service/internal/api"
 	"basisvr-social-service/internal/config"
 	"basisvr-social-service/internal/database"
+	"basisvr-social-service/internal/observability"
 )
 
 func main() {
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("configuration: %v", err)
+	}
+	tracingShutdown, err := observability.InitTracing(context.Background(), cfg.Observability)
+	if err != nil {
+		log.Fatalf("initialize tracing: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tracingShutdown(ctx); err != nil {
+			log.Printf("shutdown tracing: %v", err)
+		}
+	}()
 	appCtx, appCancel := context.WithCancel(context.Background())
 	defer appCancel()
 
@@ -27,11 +43,22 @@ func main() {
 		log.Fatalf("open database: %v", err)
 	}
 	defer db.Close()
+	if cfg.ActivityPub.Enabled {
+		actorCtx, actorCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, err = activitypub.EnsureInstanceActor(actorCtx, db, cfg)
+		actorCancel()
+		if err != nil {
+			log.Fatalf("ensure ActivityPub instance actor: %v", err)
+		}
+	}
 
 	server := &http.Server{
 		Addr:              cfg.Server.Bind,
 		Handler:           api.NewRouter(api.Deps{DB: db, Config: cfg, Context: appCtx}),
-		ReadHeaderTimeout: 5 * time.Second,
+		ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout,
+		ReadTimeout:       cfg.Server.ReadTimeout,
+		IdleTimeout:       cfg.Server.IdleTimeout,
+		MaxHeaderBytes:    cfg.Server.MaxHeaderBytes,
 	}
 
 	go func() {
@@ -46,7 +73,7 @@ func main() {
 	<-stop
 	appCancel()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 	defer shutdownCancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)

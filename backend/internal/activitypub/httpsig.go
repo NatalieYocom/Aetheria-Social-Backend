@@ -12,9 +12,26 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"basisvr-social-service/internal/activitypub/messagesig"
 )
 
 func VerifyHTTPSignatureRequest(r *http.Request, body []byte, publicKeyPEM string, expectedActorURI string, now time.Time, maxSkew time.Duration) error {
+	if strings.TrimSpace(r.Header.Get("Signature-Input")) != "" {
+		keyID, err := messagesig.KeyID(r)
+		if err != nil {
+			return err
+		}
+		if expectedActorURI != "" && keyID != expectedActorURI && !strings.HasPrefix(keyID, expectedActorURI+"#") {
+			return fmt.Errorf("Signature keyId %q does not belong to actor %q", keyID, expectedActorURI)
+		}
+		publicKey, err := parseRSAPublicKey(publicKeyPEM)
+		if err != nil {
+			return err
+		}
+		return messagesig.VerifyRequest(r, body, publicKey, keyID, now, maxSkew)
+	}
+
 	params, err := parseHTTPSignatureHeader(r.Header.Get("Signature"))
 	if err != nil {
 		return err
@@ -36,14 +53,21 @@ func VerifyHTTPSignatureRequest(r *http.Request, body []byte, publicKeyPEM strin
 	if len(headers) == 0 {
 		return errors.New("Signature headers are required")
 	}
-	for _, required := range []string{"(request-target)", "host", "date", "digest"} {
+	requiredHeaders := []string{"(request-target)", "host", "date"}
+	requiresDigest := (r.Method != http.MethodGet && r.Method != http.MethodHead) || len(body) > 0
+	if requiresDigest {
+		requiredHeaders = append(requiredHeaders, "digest")
+	}
+	for _, required := range requiredHeaders {
 		if !containsHeader(headers, required) {
 			return fmt.Errorf("Signature headers must include %s", required)
 		}
 	}
 
-	if err := verifyDigestHeader(r.Header.Get("Digest"), body); err != nil {
-		return err
+	if requiresDigest {
+		if err := verifyDigestHeader(r.Header.Get("Digest"), body); err != nil {
+			return err
+		}
 	}
 	if err := verifyDateHeader(r.Header.Get("Date"), now, maxSkew); err != nil {
 		return err

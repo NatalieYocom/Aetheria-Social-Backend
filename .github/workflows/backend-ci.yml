@@ -1,0 +1,79 @@
+name: Backend CI
+
+on:
+  push:
+    paths:
+      - "backend/**"
+      - "docker-compose.yml"
+      - ".github/workflows/backend-ci.yml"
+  pull_request:
+    paths:
+      - "backend/**"
+      - "docker-compose.yml"
+      - ".github/workflows/backend-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: basis_social
+          POSTGRES_USER: basis
+          POSTGRES_PASSWORD: basis
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U basis -d basis_social"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      DATABASE_URL: postgres://basis:basis@127.0.0.1:5432/basis_social?sslmode=disable
+      BASIS_INTEGRATION_DATABASE_URL: postgres://basis:basis@127.0.0.1:5432/basis_social?sslmode=disable
+      BASIS_INTEGRATION_REDIS_URL: redis://127.0.0.1:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache-dependency-path: backend/go.sum
+      - name: Apply migrations
+        run: go run ./cmd/migrate up
+      - name: Test
+        run: go test ./... -count=1
+      - name: Race test
+        run: go test -race ./... -count=1
+      - name: Vet
+        run: go vet ./...
+      - name: Build binaries
+        run: go build ./cmd/api ./cmd/migrate ./cmd/delivery ./cmd/retention
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image
+        run: docker build -t basisvr-social-service:ci ./backend

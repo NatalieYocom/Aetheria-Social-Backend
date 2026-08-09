@@ -35,6 +35,8 @@ func RegisterRoutes(r chi.Router, h *Handler, authMiddleware func(http.Handler) 
 		r.Post("/refresh", h.Refresh)
 	})
 	r.With(authMiddleware).Get("/api/me", h.Me)
+	r.With(authMiddleware).Get("/api/me/export", h.ExportAccount)
+	r.With(authMiddleware).Delete("/api/me", h.DeleteAccount)
 }
 
 type registerRequest struct {
@@ -55,6 +57,10 @@ type refreshRequest struct {
 	RefreshToken string `json:"refreshToken"`
 }
 
+type deleteAccountRequest struct {
+	Password string `json:"password"`
+}
+
 type authResponse struct {
 	TokenPair
 	User meResponse `json:"user"`
@@ -69,6 +75,7 @@ type meResponse struct {
 	Status      string           `json:"status"`
 	Profile     profileResponse  `json:"profile"`
 	ActivityPub actorAPIResponse `json:"activityPub"`
+	AuthVersion int64            `json:"-"`
 }
 
 type profileResponse struct {
@@ -141,6 +148,7 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		UserID:   user.ID.String(),
 		ActorID:  user.ActorID.String(),
 		Username: user.Username,
+		Version:  user.AuthVersion,
 	})
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "token_failed", "could not issue token")
@@ -187,6 +195,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		UserID:   user.ID.String(),
 		ActorID:  user.ActorID.String(),
 		Username: user.Username,
+		Version:  user.AuthVersion,
 	})
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "token_failed", "could not issue token")
@@ -197,6 +206,16 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
+	principal, err := RequirePrincipal(r.Context())
+	if err != nil {
+		httpx.WriteError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if _, err := h.db.ExecContext(r.Context(), `
+UPDATE users SET auth_version = auth_version + 1 WHERE id = $1`, principal.UserID); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "logout_failed", err.Error())
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -223,11 +242,20 @@ func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusUnauthorized, "unauthorized", "user no longer exists")
 		return
 	}
+	if user.Status != "active" {
+		httpx.WriteError(w, http.StatusUnauthorized, "account_inactive", "account is not active")
+		return
+	}
+	if claims.Subject.Version != user.AuthVersion {
+		httpx.WriteError(w, http.StatusUnauthorized, "token_revoked", "refresh token has been revoked")
+		return
+	}
 
 	pair, err := h.tokens.Issue(TokenSubject{
 		UserID:   user.ID.String(),
 		ActorID:  user.ActorID.String(),
 		Username: user.Username,
+		Version:  user.AuthVersion,
 	})
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "token_failed", "could not issue token")
@@ -253,6 +281,156 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, user)
+}
+
+func (h *Handler) ExportAccount(w http.ResponseWriter, r *http.Request) {
+	principal, err := RequirePrincipal(r.Context())
+	if err != nil {
+		httpx.WriteError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	var rawJSON []byte
+	err = h.db.QueryRowContext(r.Context(), `
+SELECT jsonb_build_object(
+  'schemaVersion', 1,
+  'generatedAt', now(),
+  'account', (SELECT to_jsonb(u) - 'password_hash' FROM users u WHERE u.id = $1),
+  'profile', (SELECT to_jsonb(p) FROM profiles p WHERE p.user_id = $1),
+  'actor', (SELECT to_jsonb(a) - 'private_key_pem_encrypted' FROM actors a WHERE a.id = $2),
+  'relationships', COALESCE((
+    SELECT jsonb_agg(to_jsonb(rel) ORDER BY rel.created_at)
+    FROM relationships rel WHERE rel.actor_id = $2 OR rel.target_actor_id = $2
+  ), '[]'::jsonb),
+  'worlds', COALESCE((
+    SELECT jsonb_agg(to_jsonb(world) ORDER BY world.created_at)
+    FROM worlds world WHERE world.owner_actor_id = $2
+  ), '[]'::jsonb),
+  'events', COALESCE((
+    SELECT jsonb_agg(to_jsonb(event) ORDER BY event.created_at)
+    FROM events event WHERE event.owner_actor_id = $2
+  ), '[]'::jsonb),
+  'invites', COALESCE((
+    SELECT jsonb_agg(to_jsonb(invite) ORDER BY invite.created_at)
+    FROM invites invite WHERE invite.from_actor_id = $2 OR invite.to_actor_id = $2
+  ), '[]'::jsonb),
+  'groupMemberships', COALESCE((
+    SELECT jsonb_agg(to_jsonb(member) ORDER BY member.created_at)
+    FROM group_members member WHERE member.actor_id = $2
+  ), '[]'::jsonb),
+  'notifications', COALESCE((
+    SELECT jsonb_agg(to_jsonb(notification) ORDER BY notification.created_at)
+    FROM notifications notification WHERE notification.actor_id = $2
+  ), '[]'::jsonb)
+)`, principal.UserID, principal.ActorID).Scan(&rawJSON)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "account_export_failed", err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="basisvr-account-export.json"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(rawJSON)
+}
+
+func (h *Handler) DeleteAccount(w http.ResponseWriter, r *http.Request) {
+	principal, err := RequirePrincipal(r.Context())
+	if err != nil {
+		httpx.WriteError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	var req deleteAccountRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Password) == "" {
+		httpx.WriteError(w, http.StatusBadRequest, "password_required", "password is required")
+		return
+	}
+	tx, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "account_delete_failed", err.Error())
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var passwordHash, domain string
+	if err := tx.QueryRowContext(r.Context(), `
+SELECT user_account.password_hash, actor.domain
+FROM users user_account
+JOIN actors actor ON actor.local_user_id = user_account.id
+WHERE user_account.id = $1 AND user_account.status = 'active'
+FOR UPDATE OF user_account, actor`, principal.UserID).Scan(&passwordHash, &domain); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			httpx.WriteError(w, http.StatusNotFound, "not_found", "active account not found")
+			return
+		}
+		httpx.WriteError(w, http.StatusInternalServerError, "account_delete_failed", err.Error())
+		return
+	}
+	if !VerifyPassword(passwordHash, req.Password) {
+		httpx.WriteError(w, http.StatusUnauthorized, "invalid_password", "password is invalid")
+		return
+	}
+	replacementHash, err := HashPassword(uuid.NewString() + uuid.NewString())
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "account_delete_failed", err.Error())
+		return
+	}
+
+	cleanupStatements := []string{
+		`DELETE FROM inbox_messages WHERE recipient_actor_id = $1 OR sender_actor_id = $1`,
+		`DELETE FROM activities WHERE actor_id = $1`,
+		`DELETE FROM activitypub_objects WHERE attributed_to_actor_id = $1`,
+		`DELETE FROM notifications WHERE actor_id = $1`,
+		`DELETE FROM invites WHERE from_actor_id = $1 OR to_actor_id = $1`,
+		`DELETE FROM presence_sessions WHERE actor_id = $1`,
+		`DELETE FROM relationships WHERE actor_id = $1 OR target_actor_id = $1`,
+		`DELETE FROM event_rsvps WHERE actor_id = $1`,
+		`DELETE FROM world_favorites WHERE actor_id = $1`,
+		`DELETE FROM group_members WHERE actor_id = $1`,
+		`DELETE FROM group_worlds WHERE added_by_actor_id = $1`,
+		`DELETE FROM group_events WHERE added_by_actor_id = $1`,
+		`WITH owned AS (DELETE FROM groups WHERE owner_actor_id = $1 RETURNING actor_id)
+         DELETE FROM actors WHERE id IN (SELECT actor_id FROM owned)`,
+		`DELETE FROM worlds WHERE owner_actor_id = $1`,
+	}
+	for _, statement := range cleanupStatements {
+		if _, err := tx.ExecContext(r.Context(), statement, principal.ActorID); err != nil {
+			httpx.WriteError(w, http.StatusInternalServerError, "account_delete_failed", err.Error())
+			return
+		}
+	}
+	anonymized := "deleted_" + strings.ReplaceAll(principal.UserID.String(), "-", "")
+	if _, err := tx.ExecContext(r.Context(), `
+UPDATE profiles
+SET display_name = 'Deleted user', bio = '', avatar_url = '', banner_url = '',
+    status_text = '', links = '[]'::jsonb, privacy_settings = '{}'::jsonb
+WHERE user_id = $1`, principal.UserID); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "account_delete_failed", err.Error())
+		return
+	}
+	if _, err := tx.ExecContext(r.Context(), `
+UPDATE actors
+SET acct = $2, preferred_username = $3, display_name = 'Deleted user',
+    public_key_pem = '', private_key_pem_encrypted = NULL, raw_json = '{}'::jsonb
+WHERE id = $1`, principal.ActorID, anonymized+"@"+domain, anonymized); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "account_delete_failed", err.Error())
+		return
+	}
+	if _, err := tx.ExecContext(r.Context(), `
+UPDATE users
+SET email = $2, username = $3, password_hash = $4,
+    status = 'deleted', auth_version = auth_version + 1
+WHERE id = $1`, principal.UserID, anonymized+"@deleted.invalid", anonymized, replacementHash); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "account_delete_failed", err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "account_delete_failed", err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) createLocalUser(ctx context.Context, email, username, displayName, passwordHash string) (meResponse, error) {
@@ -336,14 +514,14 @@ func (h *Handler) loadMe(ctx context.Context, userID uuid.UUID) (meResponse, err
 	var privacyRaw []byte
 	err := h.db.QueryRowContext(ctx, `
 SELECT
-  u.id, u.email, u.username, u.status,
+  u.id, u.email, u.username, u.status, u.auth_version,
   p.display_name, p.bio, p.avatar_url, p.banner_url, p.status_text, p.links, p.privacy_settings,
   a.id, a.acct, a.actor_uri, a.inbox_url, a.outbox_url, a.followers_url, a.following_url
 FROM users u
 JOIN profiles p ON p.user_id = u.id
 JOIN actors a ON a.local_user_id = u.id
 WHERE u.id = $1`, userID).Scan(
-		&res.ID, &res.Email, &res.Username, &res.Status,
+		&res.ID, &res.Email, &res.Username, &res.Status, &res.AuthVersion,
 		&res.Profile.DisplayName, &res.Profile.Bio, &res.Profile.AvatarURL, &res.Profile.BannerURL, &res.Profile.StatusText, &linksRaw, &privacyRaw,
 		&res.ActorID, &res.Acct, &res.ActivityPub.ActorURI, &res.ActivityPub.InboxURL, &res.ActivityPub.OutboxURL, &res.ActivityPub.FollowersURL, &res.ActivityPub.FollowingURL,
 	)

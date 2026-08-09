@@ -9,6 +9,7 @@ import (
 
 	"basisvr-social-service/internal/auth"
 	"basisvr-social-service/internal/common/httpx"
+	"basisvr-social-service/internal/common/page"
 	"basisvr-social-service/internal/notifications"
 	"basisvr-social-service/internal/realtime"
 
@@ -302,6 +303,21 @@ func (h *Handler) listByRelation(w http.ResponseWriter, r *http.Request, relatio
 		httpx.WriteError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
 		return
 	}
+	requestPage, err := page.ParseTextRequest(r, 50, 100)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_pagination", err.Error())
+		return
+	}
+	var directionArg any
+	if direction != "" {
+		directionArg = direction
+	}
+	var cursorText any
+	cursorID := uuid.Nil
+	if requestPage.Cursor != nil {
+		cursorText = requestPage.Cursor.SortText
+		cursorID = requestPage.Cursor.ID
+	}
 
 	query := `
 SELECT a.id, a.acct, a.preferred_username, a.display_name, COALESCE(p.avatar_url, '')
@@ -309,13 +325,13 @@ FROM relationships rel
 JOIN actors a ON a.id = rel.target_actor_id
 LEFT JOIN users u ON u.id = a.local_user_id
 LEFT JOIN profiles p ON p.user_id = u.id
-WHERE rel.actor_id = $1 AND rel.type = $2 AND rel.state = $3`
-	args := []any{principal.ActorID, relationType, state}
-	if direction != "" {
-		query += ` AND rel.direction = $4`
-		args = append(args, direction)
-	}
-	query += ` ORDER BY a.acct LIMIT 200`
+WHERE rel.actor_id = $1 AND rel.type = $2 AND rel.state = $3
+  AND (a.local_user_id IS NULL OR u.status = 'active')
+  AND ($4::text IS NULL OR rel.direction = $4)
+  AND ($5::text IS NULL OR (lower(a.acct), a.id) > ($5, $6))
+ORDER BY lower(a.acct), a.id
+LIMIT $7`
+	args := []any{principal.ActorID, relationType, state, directionArg, cursorText, cursorID, requestPage.Limit + 1}
 
 	rows, err := h.db.QueryContext(r.Context(), query, args...)
 	if err != nil {
@@ -337,7 +353,15 @@ WHERE rel.actor_id = $1 AND rel.type = $2 AND rel.state = $3`
 		httpx.WriteError(w, http.StatusInternalServerError, "list_relationships_failed", err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, results)
+	nextCursor := (*string)(nil)
+	if len(results) > requestPage.Limit {
+		last := results[requestPage.Limit-1]
+		nextCursor = page.NextTextCursor(page.TextCursor{SortText: strings.ToLower(last.Acct), ID: last.ActorID})
+		results = results[:requestPage.Limit]
+	}
+	httpx.WriteJSON(w, http.StatusOK, page.Response[actorSummary]{
+		Data: results, Pagination: page.Metadata{NextCursor: nextCursor, Limit: requestPage.Limit},
+	})
 }
 
 func (h *Handler) resolveRequestTarget(w http.ResponseWriter, r *http.Request) (auth.Principal, uuid.UUID, bool) {
@@ -391,11 +415,19 @@ func (h *Handler) resolveActorParam(ctx context.Context, value string) (uuid.UUI
 	var id uuid.UUID
 	if parsed, err := uuid.Parse(value); err == nil {
 		err := h.db.QueryRowContext(ctx, `
-SELECT id FROM actors WHERE id = $1 OR local_user_id = $1`, parsed).Scan(&id)
+SELECT a.id
+FROM actors a
+LEFT JOIN users u ON u.id = a.local_user_id
+WHERE (a.id = $1 OR a.local_user_id = $1)
+  AND (a.local_user_id IS NULL OR u.status = 'active')`, parsed).Scan(&id)
 		return id, err
 	}
 
 	err := h.db.QueryRowContext(ctx, `
-SELECT id FROM actors WHERE lower(acct) = $1 OR lower(preferred_username) = $1`, value).Scan(&id)
+SELECT a.id
+FROM actors a
+LEFT JOIN users u ON u.id = a.local_user_id
+WHERE (lower(a.acct) = $1 OR lower(a.preferred_username) = $1)
+  AND (a.local_user_id IS NULL OR u.status = 'active')`, value).Scan(&id)
 	return id, err
 }

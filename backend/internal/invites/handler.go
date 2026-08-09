@@ -11,6 +11,7 @@ import (
 	"basisvr-social-service/internal/auth"
 	"basisvr-social-service/internal/common/dbx"
 	"basisvr-social-service/internal/common/httpx"
+	"basisvr-social-service/internal/common/page"
 	"basisvr-social-service/internal/notifications"
 	"basisvr-social-service/internal/privacy"
 	"basisvr-social-service/internal/realtime"
@@ -73,12 +74,27 @@ type actorSummary struct {
 	DisplayName string    `json:"displayName"`
 }
 
-const worldAccessTargetSQL = `SELECT owner_actor_id, visibility FROM worlds WHERE id = $1`
-const eventAccessTargetSQL = `SELECT owner_actor_id, visibility FROM events WHERE id = $1`
+const worldAccessTargetSQL = `
+SELECT owner_actor_id, visibility
+FROM worlds w
+JOIN actors owner_actor ON owner_actor.id = w.owner_actor_id
+LEFT JOIN users owner_user ON owner_user.id = owner_actor.local_user_id
+WHERE w.id = $1
+  AND (owner_actor.local_user_id IS NULL OR owner_user.status = 'active')`
+const eventAccessTargetSQL = `
+SELECT owner_actor_id, visibility
+FROM events e
+JOIN actors owner_actor ON owner_actor.id = e.owner_actor_id
+LEFT JOIN users owner_user ON owner_user.id = owner_actor.local_user_id
+WHERE e.id = $1
+  AND (owner_actor.local_user_id IS NULL OR owner_user.status = 'active')`
 const instanceInviteTargetSQL = `
 SELECT host_actor_id, visibility, status, expires_at
-FROM instances
-WHERE id = $1`
+FROM instances i
+JOIN actors host_actor ON host_actor.id = i.host_actor_id
+LEFT JOIN users host_user ON host_user.id = host_actor.local_user_id
+WHERE i.id = $1
+  AND (host_actor.local_user_id IS NULL OR host_user.status = 'active')`
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	principal, err := auth.RequirePrincipal(r.Context())
@@ -173,11 +189,23 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
 		return
 	}
+	requestPage, err := page.ParseRequest(r, 50, 100)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_pagination", err.Error())
+		return
+	}
+	var cursorTime any
+	cursorID := uuid.Nil
+	if requestPage.Cursor != nil {
+		cursorTime = requestPage.Cursor.SortTime
+		cursorID = requestPage.Cursor.ID
+	}
 
 	rows, err := h.db.QueryContext(r.Context(), inviteQuery()+`
-WHERE i.from_actor_id = $1 OR i.to_actor_id = $1
-ORDER BY i.created_at DESC
-LIMIT 100`, principal.ActorID)
+WHERE (i.from_actor_id = $1 OR i.to_actor_id = $1)
+  AND ($2::timestamptz IS NULL OR (i.created_at, i.id) < ($2, $3))
+ORDER BY i.created_at DESC, i.id DESC
+LIMIT $4`, principal.ActorID, cursorTime, cursorID, requestPage.Limit+1)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "list_invites_failed", err.Error())
 		return
@@ -197,7 +225,15 @@ LIMIT 100`, principal.ActorID)
 		httpx.WriteError(w, http.StatusInternalServerError, "list_invites_failed", err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, invites)
+	nextCursor := (*string)(nil)
+	if len(invites) > requestPage.Limit {
+		last := invites[requestPage.Limit-1]
+		nextCursor = page.NextCursor(page.Cursor{SortTime: last.CreatedAt, ID: last.ID})
+		invites = invites[:requestPage.Limit]
+	}
+	httpx.WriteJSON(w, http.StatusOK, page.Response[InviteResponse]{
+		Data: invites, Pagination: page.Metadata{NextCursor: nextCursor, Limit: requestPage.Limit},
+	})
 }
 
 func (h *Handler) Accept(w http.ResponseWriter, r *http.Request) {
@@ -258,16 +294,26 @@ WHERE id = $1 AND to_actor_id = $2 AND state = 'pending' AND expires_at > now()`
 }
 
 func (h *Handler) resolveTargetActor(ctx context.Context, req createInviteRequest) (uuid.UUID, error) {
+	var id uuid.UUID
 	if req.ToActorID != nil {
-		return *req.ToActorID, nil
+		err := h.db.QueryRowContext(ctx, `
+SELECT a.id
+FROM actors a
+LEFT JOIN users u ON u.id = a.local_user_id
+WHERE a.id = $1
+  AND (a.local_user_id IS NULL OR u.status = 'active')`, *req.ToActorID).Scan(&id)
+		return id, err
 	}
 	acct := strings.ToLower(strings.TrimSpace(req.ToAcct))
 	if acct == "" {
 		return uuid.Nil, sql.ErrNoRows
 	}
-	var id uuid.UUID
 	err := h.db.QueryRowContext(ctx, `
-SELECT id FROM actors WHERE lower(acct) = $1 OR lower(preferred_username) = $1`, acct).Scan(&id)
+SELECT a.id
+FROM actors a
+LEFT JOIN users u ON u.id = a.local_user_id
+WHERE (lower(a.acct) = $1 OR lower(a.preferred_username) = $1)
+  AND (a.local_user_id IS NULL OR u.status = 'active')`, acct).Scan(&id)
 	return id, err
 }
 

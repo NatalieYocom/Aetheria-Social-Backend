@@ -16,6 +16,7 @@ type TokenSubject struct {
 	UserID   string `json:"userId"`
 	ActorID  string `json:"actorId"`
 	Username string `json:"username"`
+	Version  int64  `json:"version"`
 }
 
 type TokenClaims struct {

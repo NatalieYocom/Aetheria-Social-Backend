@@ -3,13 +3,13 @@ package worlds
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"regexp"
 	"strings"
 	"time"
 
+	activityoutbox "basisvr-social-service/internal/activitypub/outbox"
 	"basisvr-social-service/internal/auth"
 	"basisvr-social-service/internal/common/dbx"
 	"basisvr-social-service/internal/common/httpx"
@@ -23,10 +23,12 @@ import (
 type Handler struct {
 	db        *sql.DB
 	publicURL string
+	outbox    *activityoutbox.Service
 }
 
 func NewHandler(db *sql.DB, publicURL string) *Handler {
-	return &Handler{db: db, publicURL: strings.TrimRight(publicURL, "/")}
+	publicURL = strings.TrimRight(publicURL, "/")
+	return &Handler{db: db, publicURL: publicURL, outbox: activityoutbox.NewService(db, publicURL)}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler, authMiddleware func(http.Handler) http.Handler) {
@@ -98,7 +100,9 @@ SELECT w.id, w.slug, w.name, w.description, w.preview_url, w.launch_url, w.visib
        a.id, a.acct, a.display_name, w.created_at
 FROM worlds w
 JOIN actors a ON a.id = w.owner_actor_id
+LEFT JOIN users owner_user ON owner_user.id = a.local_user_id
 WHERE w.visibility = 'public'
+  AND (a.local_user_id IS NULL OR owner_user.status = 'active')
   AND ($1::timestamptz IS NULL OR (w.created_at, w.id) < ($1, $2))
 ORDER BY w.created_at DESC, w.id DESC
 LIMIT $3`
@@ -377,20 +381,17 @@ func (h *Handler) Announce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	activityURI := h.publicURL + "/activities/" + uuid.NewString()
-	raw, _ := json.Marshal(map[string]any{
-		"type":   "Announce",
-		"actor":  principal.ActorID.String(),
-		"object": h.publicURL + "/worlds/" + world.Slug,
+	result, err := h.outbox.PublishAnnounce(r.Context(), activityoutbox.AnnounceInput{
+		ActorID: principal.ActorID, ObjectID: world.ID, ObjectType: "World",
+		ObjectURI: h.publicURL + "/objects/" + world.ID.String(), Visibility: world.Visibility,
 	})
-	if _, err := h.db.ExecContext(r.Context(), `
-INSERT INTO activities (activity_uri, actor_id, type, object_id, object_type, visibility, raw_json, direction)
-VALUES ($1, $2, 'Announce', $3, 'World', $4, $5, 'local')`,
-		activityURI, principal.ActorID, world.ID, world.Visibility, raw); err != nil {
+	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "announce_world_failed", err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusAccepted, map[string]any{"activityUri": activityURI})
+	httpx.WriteJSON(w, http.StatusAccepted, map[string]any{
+		"activityUri": result.ActivityURI, "federationDeliveries": result.Deliveries,
+	})
 }
 
 func (h *Handler) requireOwnerTarget(w http.ResponseWriter, r *http.Request) (auth.Principal, uuid.UUID, bool) {
@@ -451,7 +452,9 @@ SELECT w.id, w.slug, w.name, w.description, w.preview_url, w.launch_url, w.visib
        a.id, a.acct, a.display_name
 FROM worlds w
 JOIN actors a ON a.id = w.owner_actor_id
-WHERE w.id = $1`, id)
+LEFT JOIN users owner_user ON owner_user.id = a.local_user_id
+WHERE w.id = $1
+  AND (a.local_user_id IS NULL OR owner_user.status = 'active')`, id)
 	return h.scanWorld(row)
 }
 
@@ -461,7 +464,9 @@ SELECT w.id, w.slug, w.name, w.description, w.preview_url, w.launch_url, w.visib
        a.id, a.acct, a.display_name
 FROM worlds w
 JOIN actors a ON a.id = w.owner_actor_id
-WHERE w.slug = $1`, strings.ToLower(strings.TrimSpace(slug)))
+LEFT JOIN users owner_user ON owner_user.id = a.local_user_id
+WHERE w.slug = $1
+  AND (a.local_user_id IS NULL OR owner_user.status = 'active')`, strings.ToLower(strings.TrimSpace(slug)))
 	return h.scanWorld(row)
 }
 

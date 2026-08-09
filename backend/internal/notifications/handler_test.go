@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"basisvr-social-service/internal/auth"
+	"basisvr-social-service/internal/common/page"
 	"basisvr-social-service/internal/realtime"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -25,7 +26,7 @@ func TestListNotificationsReturnsActorNotifications(t *testing.T) {
 	createdAt := time.Now().UTC()
 
 	mock.ExpectQuery(regexp.QuoteMeta(listUnreadNotificationsSQL)).
-		WithArgs(testPrincipal.ActorID, 25).
+		WithArgs(testPrincipal.ActorID, nil, uuid.Nil, 26).
 		WillReturnRows(notificationRows().AddRow(
 			notificationID,
 			testPrincipal.ActorID,
@@ -43,18 +44,21 @@ func TestListNotificationsReturnsActorNotifications(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
 	}
-	var body []NotificationResponse
+	var body page.Response[NotificationResponse]
 	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if len(body) != 1 {
-		t.Fatalf("len(body) = %d", len(body))
+	if len(body.Data) != 1 {
+		t.Fatalf("len(body.Data) = %d", len(body.Data))
 	}
-	if body[0].ID != notificationID {
-		t.Fatalf("body[0].ID = %s", body[0].ID)
+	if body.Data[0].ID != notificationID {
+		t.Fatalf("body.Data[0].ID = %s", body.Data[0].ID)
 	}
-	if body[0].Type != "friend.requested" {
-		t.Fatalf("body[0].Type = %q", body[0].Type)
+	if body.Data[0].Type != "friend.requested" {
+		t.Fatalf("body.Data[0].Type = %q", body.Data[0].Type)
+	}
+	if body.Pagination.Limit != 25 {
+		t.Fatalf("pagination = %+v", body.Pagination)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

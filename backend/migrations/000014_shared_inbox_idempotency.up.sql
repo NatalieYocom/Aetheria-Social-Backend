@@ -1,0 +1,4 @@
+DROP INDEX IF EXISTS inbox_messages_activity_uri_unique_idx;
+
+CREATE UNIQUE INDEX inbox_messages_recipient_activity_unique_idx
+ON inbox_messages(recipient_actor_id, activity_uri);

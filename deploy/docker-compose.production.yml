@@ -1,0 +1,118 @@
+services:
+  migrate:
+    image: ${BASIS_SOCIAL_IMAGE:?Set BASIS_SOCIAL_IMAGE}
+    restart: "no"
+    command: ["/app/migrate", "up"]
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+    secrets: [database_url]
+
+  api:
+    image: ${BASIS_SOCIAL_IMAGE:?Set BASIS_SOCIAL_IMAGE}
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      API_BIND: 0.0.0.0:8080
+      PUBLIC_URL: https://${DOMAIN:?Set DOMAIN}
+      DATABASE_URL_FILE: /run/secrets/database_url
+      REDIS_URL_FILE: /run/secrets/redis_url
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      REGISTRATION_ENABLED: ${REGISTRATION_ENABLED:-false}
+      FEDERATION_MODE: ${FEDERATION_MODE:-allowlist}
+      ACTIVITYPUB_ENABLED: ${ACTIVITYPUB_ENABLED:-true}
+      ACTIVITYPUB_DOMAIN: ${DOMAIN:?Set DOMAIN}
+      ACTIVITYPUB_AUTHORIZED_FETCH: ${ACTIVITYPUB_AUTHORIZED_FETCH:-protected}
+      METRICS_ENABLED: "true"
+      JSON_LOGS_ENABLED: "true"
+      OTEL_TRACING_ENABLED: ${OTEL_TRACING_ENABLED:-false}
+      OTEL_SERVICE_NAME: basisvr-social-api
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_TRACES_SAMPLER_RATIO: ${OTEL_TRACES_SAMPLER_RATIO:-0.1}
+      REALTIME_REPLAY_ENABLED: "true"
+    secrets: [database_url, redis_url, jwt_secret]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    expose: ["8080"]
+
+  delivery:
+    image: ${BASIS_SOCIAL_IMAGE:?Set BASIS_SOCIAL_IMAGE}
+    restart: unless-stopped
+    command: ["/app/delivery"]
+    environment:
+      APP_ENV: production
+      DATABASE_URL_FILE: /run/secrets/database_url
+      ACTIVITYPUB_FETCH_TIMEOUT: 10s
+      ACTIVITYPUB_MAX_DELIVERY_ATTEMPTS: 6
+      OTEL_TRACING_ENABLED: ${OTEL_TRACING_ENABLED:-false}
+      OTEL_SERVICE_NAME: basisvr-social-delivery
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_TRACES_SAMPLER_RATIO: ${OTEL_TRACES_SAMPLER_RATIO:-0.1}
+    secrets: [database_url]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  retention:
+    image: ${BASIS_SOCIAL_IMAGE:?Set BASIS_SOCIAL_IMAGE}
+    restart: unless-stopped
+    command: ["/app/retention"]
+    environment:
+      APP_ENV: production
+      DATABASE_URL_FILE: /run/secrets/database_url
+      RETENTION_INTERVAL: 1h
+      RETENTION_BATCH_SIZE: 1000
+    secrets: [database_url]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN}
+    ports: ["80:80", "443:443", "443:443/udp"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.158.0
+    profiles: ["telemetry"]
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    environment:
+      OTEL_BACKEND_OTLP_ENDPOINT: ${OTEL_BACKEND_OTLP_ENDPOINT:-http://telemetry-backend.invalid}
+      OTEL_BACKEND_AUTHORIZATION: ${OTEL_BACKEND_AUTHORIZATION:-}
+    volumes:
+      - ./otel-collector.yml:/etc/otelcol-contrib/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "components"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    expose: ["4317", "4318", "8888", "13133"]
+
+secrets:
+  database_url:
+    file: ${DATABASE_URL_SECRET_FILE:?Set DATABASE_URL_SECRET_FILE}
+  redis_url:
+    file: ${REDIS_URL_SECRET_FILE:?Set REDIS_URL_SECRET_FILE}
+  jwt_secret:
+    file: ${JWT_SECRET_FILE:?Set JWT_SECRET_FILE}
+
+volumes:
+  caddy_data:
+  caddy_config:

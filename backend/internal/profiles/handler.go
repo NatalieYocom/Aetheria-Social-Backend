@@ -11,6 +11,7 @@ import (
 	"basisvr-social-service/internal/auth"
 	"basisvr-social-service/internal/common/dbx"
 	"basisvr-social-service/internal/common/httpx"
+	"basisvr-social-service/internal/common/page"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -81,10 +82,23 @@ func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) SearchUsers(w http.ResponseWriter, r *http.Request) {
+	requestPage, err := page.ParseTextRequest(r, 24, 100)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_pagination", err.Error())
+		return
+	}
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	if query == "" {
-		httpx.WriteJSON(w, http.StatusOK, []publicProfileResponse{})
+		httpx.WriteJSON(w, http.StatusOK, page.Response[publicProfileResponse]{
+			Data: []publicProfileResponse{}, Pagination: page.Metadata{Limit: requestPage.Limit},
+		})
 		return
+	}
+	var cursorText any
+	cursorID := uuid.Nil
+	if requestPage.Cursor != nil {
+		cursorText = requestPage.Cursor.SortText
+		cursorID = requestPage.Cursor.ID
 	}
 
 	rows, err := h.db.QueryContext(r.Context(), `
@@ -94,8 +108,9 @@ JOIN profiles p ON p.user_id = u.id
 JOIN actors a ON a.local_user_id = u.id
 WHERE u.status = 'active'
   AND (u.username ILIKE $1 OR p.display_name ILIKE $1 OR a.acct ILIKE $1)
-ORDER BY u.username
-LIMIT 50`, "%"+query+"%")
+  AND ($2::text IS NULL OR (lower(u.username), u.id) > ($2, $3))
+ORDER BY lower(u.username), u.id
+LIMIT $4`, "%"+query+"%", cursorText, cursorID, requestPage.Limit+1)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "search_failed", err.Error())
 		return
@@ -115,7 +130,15 @@ LIMIT 50`, "%"+query+"%")
 		httpx.WriteError(w, http.StatusInternalServerError, "search_failed", err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, results)
+	nextCursor := (*string)(nil)
+	if len(results) > requestPage.Limit {
+		last := results[requestPage.Limit-1]
+		nextCursor = page.NextTextCursor(page.TextCursor{SortText: strings.ToLower(last.Username), ID: last.ID})
+		results = results[:requestPage.Limit]
+	}
+	httpx.WriteJSON(w, http.StatusOK, page.Response[publicProfileResponse]{
+		Data: results, Pagination: page.Metadata{NextCursor: nextCursor, Limit: requestPage.Limit},
+	})
 }
 
 func (h *Handler) UpdateMe(w http.ResponseWriter, r *http.Request) {

@@ -3,14 +3,7 @@ package delivery
 import (
 	"bytes"
 	"context"
-	"crypto"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
-	"crypto/x509"
 	"database/sql"
-	"encoding/base64"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
@@ -18,9 +11,12 @@ import (
 	"strings"
 	"time"
 
+	"basisvr-social-service/internal/activitypub/legacysig"
+	"basisvr-social-service/internal/activitypub/messagesig"
 	"basisvr-social-service/internal/activitypub/resolver"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 type Job struct {
@@ -51,10 +47,16 @@ func NewWorker(db *sql.DB, client *http.Client, maxAttempts int) Worker {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
+	clientCopy := *client
+	transport := clientCopy.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	clientCopy.Transport = otelhttp.NewTransport(transport)
 	if maxAttempts <= 0 {
 		maxAttempts = 6
 	}
-	return Worker{db: db, client: client, maxAttempts: maxAttempts}
+	return Worker{db: db, client: &clientCopy, maxAttempts: maxAttempts}
 }
 
 func (w Worker) DeliverDueOne(ctx context.Context) (bool, error) {
@@ -108,6 +110,26 @@ func (w Worker) DeliverDueOne(ctx context.Context) (bool, error) {
 			return false, commitErr
 		}
 		return true, nil
+	}
+	if res.StatusCode == http.StatusBadRequest || res.StatusCode == http.StatusUnauthorized {
+		_ = res.Body.Close()
+		modernRequest, signErr := NewMessageSignedActivityRequest(ctx, job.TargetInboxURL, job.ActorURI, job.PrivateKeyPEM, job.RawJSON)
+		if signErr != nil {
+			if updateErr := markFailedOrRetry(ctx, tx, job, w.maxAttempts, signErr); updateErr != nil {
+				return false, updateErr
+			}
+			return false, signErr
+		}
+		res, err = w.client.Do(modernRequest)
+		if err != nil {
+			if updateErr := markFailedOrRetry(ctx, tx, job, w.maxAttempts, err); updateErr != nil {
+				return false, updateErr
+			}
+			if commitErr := tx.Commit(); commitErr != nil {
+				return false, commitErr
+			}
+			return true, nil
+		}
 	}
 	defer res.Body.Close()
 
@@ -233,61 +255,34 @@ func NewSignedActivityRequest(ctx context.Context, inboxURL string, actorURI str
 	if !resolver.IsSafeRemoteURL(inboxURL) {
 		return nil, fmt.Errorf("blocked target inbox URL: %s", inboxURL)
 	}
-	privateKey, err := parseRSAPrivateKey(privateKeyPEM)
-	if err != nil {
-		return nil, err
-	}
-
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, inboxURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/activity+json")
-	req.Header.Set("Date", time.Now().UTC().Format(http.TimeFormat))
-	req.Header.Set("Digest", digestHeader(body))
 	req.Header.Set("User-Agent", "BasisVR-Social-Service/0.1")
-
-	signingString := strings.Join([]string{
-		"(request-target): post " + req.URL.RequestURI(),
-		"host: " + req.URL.Host,
-		"date: " + req.Header.Get("Date"),
-		"digest: " + req.Header.Get("Digest"),
-	}, "\n")
-
-	hashed := sha256.Sum256([]byte(signingString))
-	signatureBytes, err := rsa.SignPKCS1v15(rand.Reader, privateKey, crypto.SHA256, hashed[:])
-	if err != nil {
+	if err := SignLegacyRequest(req, actorURI, privateKeyPEM, body, time.Now()); err != nil {
 		return nil, err
 	}
-
-	req.Header.Set("Signature", fmt.Sprintf(
-		`keyId="%s#main-key",algorithm="rsa-sha256",headers="(request-target) host date digest",signature="%s"`,
-		actorURI,
-		base64.StdEncoding.EncodeToString(signatureBytes),
-	))
 	return req, nil
 }
 
-func digestHeader(body []byte) string {
-	sum := sha256.Sum256(body)
-	return "SHA-256=" + base64.StdEncoding.EncodeToString(sum[:])
-}
-
-func parseRSAPrivateKey(privateKeyPEM string) (*rsa.PrivateKey, error) {
-	block, _ := pem.Decode([]byte(privateKeyPEM))
-	if block == nil {
-		return nil, errors.New("private key PEM is empty or invalid")
+func NewMessageSignedActivityRequest(ctx context.Context, inboxURL string, actorURI string, privateKeyPEM string, body []byte) (*http.Request, error) {
+	if !resolver.IsSafeRemoteURL(inboxURL) {
+		return nil, fmt.Errorf("blocked target inbox URL: %s", inboxURL)
 	}
-	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
-		return key, nil
-	}
-	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, inboxURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	key, ok := parsed.(*rsa.PrivateKey)
-	if !ok {
-		return nil, errors.New("private key is not RSA")
+	req.Header.Set("Content-Type", "application/activity+json")
+	req.Header.Set("User-Agent", "BasisVR-Social-Service/0.1")
+	if err := messagesig.SignRequestPEM(req, body, actorURI+"#main-key", privateKeyPEM, time.Now()); err != nil {
+		return nil, err
 	}
-	return key, nil
+	return req, nil
+}
+
+func SignLegacyRequest(req *http.Request, actorURI string, privateKeyPEM string, body []byte, now time.Time) error {
+	return legacysig.SignRequest(req, actorURI, privateKeyPEM, body, now)
 }

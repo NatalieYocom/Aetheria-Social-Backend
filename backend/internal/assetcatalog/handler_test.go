@@ -207,7 +207,7 @@ func TestAttachWorldAssetRequiresWorldOwnerAndReturnsLinkedAssets(t *testing.T) 
 	testActorIDFromDBExpectation = actorID
 	router := newTestRouter(db, config.AssetCatalogConfig{}, fakeClientFactory{})
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT owner_actor_id FROM worlds WHERE id = $1`)).
+	mock.ExpectQuery("(?s)SELECT owner_actor_id.*FROM worlds w.*owner_user.status = 'active'").
 		WithArgs(worldID).
 		WillReturnRows(sqlmock.NewRows([]string{"owner_actor_id"}).AddRow(actorID))
 	mock.ExpectExec("INSERT INTO world_asset_refs").
@@ -273,7 +273,7 @@ func TestListWorldAssetsForPrivateWorldWithoutAccessReturnsNotFound(t *testing.T
 	ownerID := uuid.New()
 	router := newTestRouter(db, config.AssetCatalogConfig{}, fakeClientFactory{})
 
-	mock.ExpectQuery("SELECT owner_actor_id, visibility FROM worlds WHERE id").
+	mock.ExpectQuery("(?s)SELECT owner_actor_id, visibility.*FROM worlds w.*owner_user.status = 'active'").
 		WithArgs(worldID).
 		WillReturnRows(sqlmock.NewRows([]string{"owner_actor_id", "visibility"}).AddRow(ownerID, "private"))
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5/middleware"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func RequestLogger(out io.Writer) func(http.Handler) http.Handler {
@@ -29,6 +30,11 @@ func RequestLogger(out io.Writer) func(http.Handler) http.Handler {
 				"duration_ms": float64(time.Since(start).Microseconds()) / 1000,
 				"remote_ip":   remoteIP(r),
 				"user_agent":  r.UserAgent(),
+			}
+			spanContext := trace.SpanContextFromContext(r.Context())
+			if spanContext.IsValid() {
+				entry["trace_id"] = spanContext.TraceID().String()
+				entry["span_id"] = spanContext.SpanID().String()
 			}
 			_ = json.NewEncoder(out).Encode(entry)
 		})

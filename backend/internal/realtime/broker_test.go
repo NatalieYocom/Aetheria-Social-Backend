@@ -2,11 +2,37 @@ package realtime
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+type stubReplayStore struct {
+	append func(context.Context, uuid.UUID, Event) (Event, error)
+	replay func(context.Context, uuid.UUID, string, int) (ReplayResult, error)
+}
+
+func (s stubReplayStore) Append(ctx context.Context, actorID uuid.UUID, event Event) (Event, error) {
+	return s.append(ctx, actorID, event)
+}
+
+func (s stubReplayStore) Replay(ctx context.Context, actorID uuid.UUID, after string, limit int) (ReplayResult, error) {
+	return s.replay(ctx, actorID, after, limit)
+}
+
+func TestEventSerializesReplayCursor(t *testing.T) {
+	data, err := json.Marshal(Event{ID: uuid.NewString(), Cursor: "1710000000000-2", Type: "presence.updated"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"cursor":"1710000000000-2"`) {
+		t.Fatalf("event JSON = %s", data)
+	}
+}
 
 func TestBrokerPublishesEventToActorSubscriber(t *testing.T) {
 	broker := NewBroker(BrokerConfig{BufferSize: 2})
@@ -79,6 +105,88 @@ func TestBrokerPublishDoesNotBlockSlowSubscriber(t *testing.T) {
 	}
 }
 
+func TestBrokerStoresEventBeforeLocalFanout(t *testing.T) {
+	broker := NewBroker(BrokerConfig{BufferSize: 2})
+	actorID := uuid.New()
+	stored := false
+	broker.AttachReplayStore(stubReplayStore{
+		append: func(_ context.Context, gotActorID uuid.UUID, event Event) (Event, error) {
+			if gotActorID != actorID {
+				t.Fatalf("actorID = %s", gotActorID)
+			}
+			stored = true
+			event.Cursor = "1710000000000-1"
+			return event, nil
+		},
+	}, 100*time.Millisecond)
+	events, unsubscribe := broker.Subscribe(context.Background(), actorID)
+	defer unsubscribe()
+
+	broker.Publish(actorID, Event{Type: "presence.updated"})
+
+	event := <-events
+	if !stored {
+		t.Fatal("event was delivered before replay persistence")
+	}
+	if event.Cursor != "1710000000000-1" {
+		t.Fatalf("event.Cursor = %q", event.Cursor)
+	}
+	stats := broker.Stats()
+	if stats.ReplayStored != 1 || stats.ReplayStoreFailures != 0 {
+		t.Fatalf("stats = %+v", stats)
+	}
+}
+
+func TestBrokerContinuesLiveFanoutWhenReplayStoreFails(t *testing.T) {
+	broker := NewBroker(BrokerConfig{BufferSize: 2})
+	actorID := uuid.New()
+	broker.AttachReplayStore(stubReplayStore{
+		append: func(context.Context, uuid.UUID, Event) (Event, error) {
+			return Event{}, errors.New("redis unavailable")
+		},
+	}, 100*time.Millisecond)
+	events, unsubscribe := broker.Subscribe(context.Background(), actorID)
+	defer unsubscribe()
+
+	broker.Publish(actorID, Event{Type: "presence.updated"})
+
+	select {
+	case event := <-events:
+		if event.Type != "presence.updated" {
+			t.Fatalf("event.Type = %q", event.Type)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("live fanout stopped after replay store failure")
+	}
+	if broker.Stats().ReplayStoreFailures != 1 {
+		t.Fatalf("stats = %+v", broker.Stats())
+	}
+}
+
+func TestBrokerReplaysStoredEvents(t *testing.T) {
+	broker := NewBroker(BrokerConfig{})
+	actorID := uuid.New()
+	broker.AttachReplayStore(stubReplayStore{
+		replay: func(_ context.Context, gotActorID uuid.UUID, after string, limit int) (ReplayResult, error) {
+			if gotActorID != actorID || after != "1710000000000-0" || limit != 50 {
+				t.Fatalf("Replay(%s, %q, %d)", gotActorID, after, limit)
+			}
+			return ReplayResult{Events: []Event{{Cursor: "1710000000001-0", Type: "presence.updated"}}}, nil
+		},
+	}, 100*time.Millisecond)
+
+	result, err := broker.Replay(context.Background(), actorID, "1710000000000-0", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Events) != 1 || result.Events[0].Cursor != "1710000000001-0" {
+		t.Fatalf("result = %+v", result)
+	}
+	if broker.Stats().ReplayDelivered != 1 || broker.Stats().ReplayRequests != 1 {
+		t.Fatalf("stats = %+v", broker.Stats())
+	}
+}
+
 func TestBrokerPublishesThroughBusToAnotherBroker(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -143,13 +251,18 @@ func TestBrokerIgnoresOwnBusEcho(t *testing.T) {
 }
 
 type memoryBus struct {
-	subscribe chan chan []byte
+	subscribe chan memorySubscription
 	publish   chan []byte
+}
+
+type memorySubscription struct {
+	messages chan []byte
+	ready    chan struct{}
 }
 
 func newMemoryBus() *memoryBus {
 	bus := &memoryBus{
-		subscribe: make(chan chan []byte, 8),
+		subscribe: make(chan memorySubscription, 8),
 		publish:   make(chan []byte, 8),
 	}
 	go bus.run()
@@ -167,8 +280,17 @@ func (b *memoryBus) Publish(ctx context.Context, topic string, data []byte) erro
 
 func (b *memoryBus) Subscribe(ctx context.Context, topic string) (<-chan []byte, error) {
 	ch := make(chan []byte, 8)
+	subscription := memorySubscription{
+		messages: ch,
+		ready:    make(chan struct{}),
+	}
 	select {
-	case b.subscribe <- ch:
+	case b.subscribe <- subscription:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case <-subscription.ready:
 		return ch, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -183,8 +305,9 @@ func (b *memoryBus) run() {
 	subscribers := []chan []byte{}
 	for {
 		select {
-		case ch := <-b.subscribe:
-			subscribers = append(subscribers, ch)
+		case subscription := <-b.subscribe:
+			subscribers = append(subscribers, subscription.messages)
+			close(subscription.ready)
 		case data := <-b.publish:
 			for _, ch := range subscribers {
 				select {

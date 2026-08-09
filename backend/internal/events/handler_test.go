@@ -63,7 +63,9 @@ func TestGetPrivateEventWithoutViewerReturnsNotFound(t *testing.T) {
 	start := time.Now().UTC().Add(time.Hour)
 	end := start.Add(time.Hour)
 
-	mock.ExpectQuery(regexp.QuoteMeta(eventQuery() + ` WHERE e.slug = $1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(eventQuery() + ` WHERE e.slug = $1
+  AND (a.local_user_id IS NULL OR event_owner_user.status = 'active')
+  AND (world_owner.local_user_id IS NULL OR world_owner_user.status = 'active')`)).
 		WithArgs("private-event").
 		WillReturnRows(eventRows().AddRow(
 			eventID,
@@ -103,7 +105,9 @@ func TestGetFriendsEventAllowsAcceptedFriend(t *testing.T) {
 	start := time.Now().UTC().Add(time.Hour)
 	end := start.Add(time.Hour)
 
-	mock.ExpectQuery(regexp.QuoteMeta(eventQuery() + ` WHERE e.slug = $1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(eventQuery() + ` WHERE e.slug = $1
+  AND (a.local_user_id IS NULL OR event_owner_user.status = 'active')
+  AND (world_owner.local_user_id IS NULL OR world_owner_user.status = 'active')`)).
 		WithArgs("friends-event").
 		WillReturnRows(eventRows().AddRow(
 			eventID,

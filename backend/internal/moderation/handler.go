@@ -5,24 +5,30 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
 	"basisvr-social-service/internal/auth"
 	"basisvr-social-service/internal/common/dbx"
 	"basisvr-social-service/internal/common/httpx"
+	"basisvr-social-service/internal/common/page"
+	"basisvr-social-service/internal/realtime"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )
 
 type Handler struct {
-	db *sql.DB
+	db     *sql.DB
+	events *realtime.Broker
 }
 
-func NewHandler(db *sql.DB) *Handler {
-	return &Handler{db: db}
+func NewHandler(db *sql.DB, brokers ...*realtime.Broker) *Handler {
+	var broker *realtime.Broker
+	if len(brokers) > 0 {
+		broker = brokers[0]
+	}
+	return &Handler{db: db, events: broker}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler, authMiddleware func(http.Handler) http.Handler) {
@@ -33,6 +39,8 @@ func RegisterRoutes(r chi.Router, h *Handler, authMiddleware func(http.Handler) 
 
 		r.Get("/api/moderation/reports", h.ListReports)
 		r.Patch("/api/moderation/reports/{id}", h.UpdateReport)
+		r.Get("/api/moderation/actions", h.ListActions)
+		r.Post("/api/moderation/users/{actorId}/actions", h.ApplyUserAction)
 		r.Get("/api/moderation/domain-blocks", h.ListDomainBlocks)
 		r.Post("/api/moderation/domain-blocks", h.UpsertDomainBlock)
 		r.Delete("/api/moderation/domain-blocks/{domain}", h.DeleteDomainBlock)
@@ -53,6 +61,30 @@ type createReportRequest struct {
 type updateReportRequest struct {
 	State string `json:"state"`
 }
+
+type userActionRequest struct {
+	Action   string     `json:"action"`
+	Reason   string     `json:"reason"`
+	ReportID *uuid.UUID `json:"reportId"`
+}
+
+type ModerationActionResponse struct {
+	ID              uuid.UUID  `json:"id"`
+	ModeratorUserID uuid.UUID  `json:"moderatorUserId"`
+	TargetUserID    uuid.UUID  `json:"targetUserId"`
+	TargetActorID   uuid.UUID  `json:"targetActorId"`
+	Action          string     `json:"action"`
+	Reason          string     `json:"reason"`
+	ReportID        *uuid.UUID `json:"reportId,omitempty"`
+	CreatedAt       time.Time  `json:"createdAt"`
+}
+
+const moderationTargetSQL = `
+SELECT u.id, a.id, u.role, u.status
+FROM users u
+JOIN actors a ON a.local_user_id = u.id
+WHERE a.id = $1
+FOR UPDATE OF u`
 
 type upsertDomainBlockRequest struct {
 	Domain   string `json:"domain"`
@@ -127,18 +159,25 @@ func (h *Handler) ListMyReports(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
 		return
 	}
+	requestPage, err := page.ParseRequest(r, 50, 100)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_pagination", err.Error())
+		return
+	}
+	cursorTime, cursorID := timeCursorArgs(requestPage.Cursor)
 	rows, err := h.db.QueryContext(r.Context(), `
 SELECT id, reporter_actor_id, target_actor_id, target_object_uri, reason, state, created_at
 FROM reports
 WHERE reporter_actor_id = $1
-ORDER BY created_at DESC
-LIMIT $2`, principal.ActorID, parseLimit(r, 50, 100))
+  AND ($2::timestamptz IS NULL OR (created_at, id) < ($2, $3))
+ORDER BY created_at DESC, id DESC
+LIMIT $4`, principal.ActorID, cursorTime, cursorID, requestPage.Limit+1)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "list_reports_failed", err.Error())
 		return
 	}
 	defer rows.Close()
-	writeReports(w, rows)
+	writeReports(w, rows, requestPage)
 }
 
 func (h *Handler) ListReports(w http.ResponseWriter, r *http.Request) {
@@ -149,18 +188,25 @@ func (h *Handler) ListReports(w http.ResponseWriter, r *http.Request) {
 	if state == "" {
 		state = "open"
 	}
+	requestPage, err := page.ParseRequest(r, 50, 100)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_pagination", err.Error())
+		return
+	}
+	cursorTime, cursorID := timeCursorArgs(requestPage.Cursor)
 	rows, err := h.db.QueryContext(r.Context(), `
 SELECT r.id, r.reporter_actor_id, r.target_actor_id, r.target_object_uri, r.reason, r.state, r.created_at
 FROM reports r
 WHERE r.state = $1
-ORDER BY r.created_at DESC
-LIMIT $2`, state, parseLimit(r, 50, 200))
+  AND ($2::timestamptz IS NULL OR (r.created_at, r.id) < ($2, $3))
+ORDER BY r.created_at DESC, r.id DESC
+LIMIT $4`, state, cursorTime, cursorID, requestPage.Limit+1)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "list_reports_failed", err.Error())
 		return
 	}
 	defer rows.Close()
-	writeReports(w, rows)
+	writeReports(w, rows, requestPage)
 }
 
 func (h *Handler) UpdateReport(w http.ResponseWriter, r *http.Request) {
@@ -197,15 +243,227 @@ RETURNING id, reporter_actor_id, target_actor_id, target_object_uri, reason, sta
 	httpx.WriteJSON(w, http.StatusOK, report)
 }
 
+func (h *Handler) ApplyUserAction(w http.ResponseWriter, r *http.Request) {
+	principal, moderatorRole, ok := h.requireModeratorIdentity(w, r)
+	if !ok {
+		return
+	}
+	targetActorID, ok := parseUUIDParam(w, r, "actorId")
+	if !ok {
+		return
+	}
+	if targetActorID == principal.ActorID {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_target", "cannot moderate yourself")
+		return
+	}
+	var req userActionRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	req.Action = strings.ToLower(strings.TrimSpace(req.Action))
+	req.Reason = strings.TrimSpace(req.Reason)
+	if req.Action != "suspend" && req.Action != "restore" {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_action", "action must be suspend or restore")
+		return
+	}
+	if req.Reason == "" {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_reason", "reason is required")
+		return
+	}
+
+	tx, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "moderation_action_failed", err.Error())
+		return
+	}
+	defer tx.Rollback()
+	var targetUserID, resolvedActorID uuid.UUID
+	var targetRole, currentStatus string
+	if err := tx.QueryRowContext(r.Context(), moderationTargetSQL, targetActorID).Scan(
+		&targetUserID, &resolvedActorID, &targetRole, &currentStatus,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			httpx.WriteError(w, http.StatusNotFound, "not_found", "local user not found")
+			return
+		}
+		httpx.WriteError(w, http.StatusInternalServerError, "moderation_action_failed", err.Error())
+		return
+	}
+	if targetRole == "admin" || (targetRole == "moderator" && moderatorRole != "admin") {
+		httpx.WriteError(w, http.StatusForbidden, "protected_account", "insufficient role to moderate this account")
+		return
+	}
+	if req.ReportID != nil {
+		var reportMatches bool
+		if err := tx.QueryRowContext(r.Context(), `
+SELECT EXISTS (
+  SELECT 1 FROM reports WHERE id = $1 AND target_actor_id = $2
+)`, *req.ReportID, targetActorID).Scan(&reportMatches); err != nil {
+			httpx.WriteError(w, http.StatusInternalServerError, "moderation_action_failed", err.Error())
+			return
+		}
+		if !reportMatches {
+			httpx.WriteError(w, http.StatusBadRequest, "invalid_report", "report does not target this actor")
+			return
+		}
+	}
+	targetStatus := "suspended"
+	if req.Action == "restore" {
+		targetStatus = "active"
+	}
+	if currentStatus == targetStatus {
+		httpx.WriteError(w, http.StatusConflict, "status_unchanged", "account already has the requested status")
+		return
+	}
+	statusUpdateSQL := `UPDATE users SET status = $2 WHERE id = $1`
+	if req.Action == "suspend" {
+		statusUpdateSQL = `UPDATE users SET status = $2, auth_version = auth_version + 1 WHERE id = $1`
+	}
+	if _, err := tx.ExecContext(r.Context(), statusUpdateSQL, targetUserID, targetStatus); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "moderation_action_failed", err.Error())
+		return
+	}
+	if req.Action == "suspend" {
+		if _, err := tx.ExecContext(r.Context(), `DELETE FROM presence_sessions WHERE actor_id = $1`, targetActorID); err != nil {
+			httpx.WriteError(w, http.StatusInternalServerError, "moderation_action_failed", err.Error())
+			return
+		}
+		rows, err := tx.QueryContext(r.Context(), `
+UPDATE instance_members
+SET state = 'left', left_at = now(), last_seen_at = now()
+WHERE actor_id = $1 AND state = 'joined'
+RETURNING instance_id`, targetActorID)
+		if err != nil {
+			httpx.WriteError(w, http.StatusInternalServerError, "moderation_action_failed", err.Error())
+			return
+		}
+		instanceIDs := []uuid.UUID{}
+		for rows.Next() {
+			var instanceID uuid.UUID
+			if err := rows.Scan(&instanceID); err != nil {
+				rows.Close()
+				httpx.WriteError(w, http.StatusInternalServerError, "moderation_action_failed", err.Error())
+				return
+			}
+			instanceIDs = append(instanceIDs, instanceID)
+		}
+		if err := rows.Close(); err != nil {
+			httpx.WriteError(w, http.StatusInternalServerError, "moderation_action_failed", err.Error())
+			return
+		}
+		for _, instanceID := range instanceIDs {
+			if _, err := tx.ExecContext(r.Context(), `
+UPDATE instances
+SET current_users = GREATEST(current_users - 1, 0)
+WHERE id = $1`, instanceID); err != nil {
+				httpx.WriteError(w, http.StatusInternalServerError, "moderation_action_failed", err.Error())
+				return
+			}
+		}
+		if _, err := tx.ExecContext(r.Context(), `
+UPDATE instance_join_tickets
+SET expires_at = now()
+WHERE actor_id = $1 AND consumed_at IS NULL AND expires_at > now()`, targetActorID); err != nil {
+			httpx.WriteError(w, http.StatusInternalServerError, "moderation_action_failed", err.Error())
+			return
+		}
+	}
+	action, err := scanModerationAction(tx.QueryRowContext(r.Context(), `
+INSERT INTO moderation_actions (moderator_user_id, target_user_id, target_actor_id, action, reason, report_id)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, moderator_user_id, target_user_id, target_actor_id, action, reason, report_id, created_at`,
+		principal.UserID, targetUserID, targetActorID, req.Action, req.Reason, dbx.NullUUID(req.ReportID)))
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "moderation_action_failed", err.Error())
+		return
+	}
+	if req.ReportID != nil {
+		if _, err := tx.ExecContext(r.Context(), `UPDATE reports SET state = 'resolved' WHERE id = $1`, *req.ReportID); err != nil {
+			httpx.WriteError(w, http.StatusInternalServerError, "moderation_action_failed", err.Error())
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "moderation_action_failed", err.Error())
+		return
+	}
+	eventType := "user.restored"
+	if req.Action == "suspend" {
+		eventType = "user.suspended"
+	}
+	realtime.PublishActorEvent(h.events, []uuid.UUID{targetActorID}, eventType, principal.ActorID, map[string]any{
+		"actorId": targetActorID, "actionId": action.ID,
+	})
+	httpx.WriteJSON(w, http.StatusOK, action)
+}
+
+func (h *Handler) ListActions(w http.ResponseWriter, r *http.Request) {
+	if !h.requireModerator(w, r) {
+		return
+	}
+	requestPage, err := page.ParseRequest(r, 50, 100)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_pagination", err.Error())
+		return
+	}
+	cursorTime, cursorID := timeCursorArgs(requestPage.Cursor)
+	rows, err := h.db.QueryContext(r.Context(), `
+SELECT id, moderator_user_id, target_user_id, target_actor_id, action, reason, report_id, created_at
+FROM moderation_actions
+WHERE $1::timestamptz IS NULL OR (created_at, id) < ($1, $2)
+ORDER BY created_at DESC, id DESC
+LIMIT $3`, cursorTime, cursorID, requestPage.Limit+1)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "list_moderation_actions_failed", err.Error())
+		return
+	}
+	defer rows.Close()
+	items := []ModerationActionResponse{}
+	for rows.Next() {
+		item, err := scanModerationAction(rows)
+		if err != nil {
+			httpx.WriteError(w, http.StatusInternalServerError, "scan_moderation_action_failed", err.Error())
+			return
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "list_moderation_actions_failed", err.Error())
+		return
+	}
+	nextCursor := (*string)(nil)
+	if len(items) > requestPage.Limit {
+		last := items[requestPage.Limit-1]
+		nextCursor = page.NextCursor(page.Cursor{SortTime: last.CreatedAt, ID: last.ID})
+		items = items[:requestPage.Limit]
+	}
+	httpx.WriteJSON(w, http.StatusOK, page.Response[ModerationActionResponse]{
+		Data: items, Pagination: page.Metadata{NextCursor: nextCursor, Limit: requestPage.Limit},
+	})
+}
+
 func (h *Handler) ListDomainBlocks(w http.ResponseWriter, r *http.Request) {
 	if !h.requireModerator(w, r) {
 		return
 	}
+	requestPage, err := page.ParseTextRequest(r, 100, 100)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_pagination", err.Error())
+		return
+	}
+	var cursorText any
+	cursorID := uuid.Nil
+	if requestPage.Cursor != nil {
+		cursorText = requestPage.Cursor.SortText
+		cursorID = requestPage.Cursor.ID
+	}
 	rows, err := h.db.QueryContext(r.Context(), `
 SELECT id, domain, severity, reason, created_at
 FROM domain_blocks
-ORDER BY domain ASC
-LIMIT $1`, parseLimit(r, 100, 500))
+WHERE $1::text IS NULL OR (lower(domain), id) > ($1, $2)
+ORDER BY lower(domain), id
+LIMIT $3`, cursorText, cursorID, requestPage.Limit+1)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "list_domain_blocks_failed", err.Error())
 		return
@@ -225,7 +483,15 @@ LIMIT $1`, parseLimit(r, 100, 500))
 		httpx.WriteError(w, http.StatusInternalServerError, "list_domain_blocks_failed", err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, items)
+	nextCursor := (*string)(nil)
+	if len(items) > requestPage.Limit {
+		last := items[requestPage.Limit-1]
+		nextCursor = page.NextTextCursor(page.TextCursor{SortText: strings.ToLower(last.Domain), ID: last.ID})
+		items = items[:requestPage.Limit]
+	}
+	httpx.WriteJSON(w, http.StatusOK, page.Response[DomainBlockResponse]{
+		Data: items, Pagination: page.Metadata{NextCursor: nextCursor, Limit: requestPage.Limit},
+	})
 }
 
 func (h *Handler) UpsertDomainBlock(w http.ResponseWriter, r *http.Request) {
@@ -282,28 +548,33 @@ func (h *Handler) DeleteDomainBlock(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) requireModerator(w http.ResponseWriter, r *http.Request) bool {
+	_, _, ok := h.requireModeratorIdentity(w, r)
+	return ok
+}
+
+func (h *Handler) requireModeratorIdentity(w http.ResponseWriter, r *http.Request) (auth.Principal, string, bool) {
 	principal, err := auth.RequirePrincipal(r.Context())
 	if err != nil {
 		httpx.WriteError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
-		return false
+		return auth.Principal{}, "", false
 	}
 	var role string
 	if err := h.db.QueryRowContext(r.Context(), currentUserRoleSQL, principal.UserID).Scan(&role); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			httpx.WriteError(w, http.StatusForbidden, "forbidden", "moderator role required")
-			return false
+			return auth.Principal{}, "", false
 		}
 		httpx.WriteError(w, http.StatusInternalServerError, "role_check_failed", err.Error())
-		return false
+		return auth.Principal{}, "", false
 	}
 	if role != "moderator" && role != "admin" {
 		httpx.WriteError(w, http.StatusForbidden, "forbidden", "moderator role required")
-		return false
+		return auth.Principal{}, "", false
 	}
-	return true
+	return principal, role, true
 }
 
-func writeReports(w http.ResponseWriter, rows *sql.Rows) {
+func writeReports(w http.ResponseWriter, rows *sql.Rows, requestPage page.Request) {
 	items := []ReportResponse{}
 	for rows.Next() {
 		item, err := scanReport(rows)
@@ -317,7 +588,22 @@ func writeReports(w http.ResponseWriter, rows *sql.Rows) {
 		httpx.WriteError(w, http.StatusInternalServerError, "list_reports_failed", err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, items)
+	nextCursor := (*string)(nil)
+	if len(items) > requestPage.Limit {
+		last := items[requestPage.Limit-1]
+		nextCursor = page.NextCursor(page.Cursor{SortTime: last.CreatedAt, ID: last.ID})
+		items = items[:requestPage.Limit]
+	}
+	httpx.WriteJSON(w, http.StatusOK, page.Response[ReportResponse]{
+		Data: items, Pagination: page.Metadata{NextCursor: nextCursor, Limit: requestPage.Limit},
+	})
+}
+
+func timeCursorArgs(cursor *page.Cursor) (any, uuid.UUID) {
+	if cursor == nil {
+		return nil, uuid.Nil
+	}
+	return cursor.SortTime, cursor.ID
 }
 
 type scanner interface {
@@ -354,6 +640,17 @@ func scanDomainBlock(row scanner) (DomainBlockResponse, error) {
 	return block, nil
 }
 
+func scanModerationAction(row scanner) (ModerationActionResponse, error) {
+	var action ModerationActionResponse
+	var reportID uuid.NullUUID
+	if err := row.Scan(&action.ID, &action.ModeratorUserID, &action.TargetUserID, &action.TargetActorID,
+		&action.Action, &action.Reason, &reportID, &action.CreatedAt); err != nil {
+		return ModerationActionResponse{}, err
+	}
+	action.ReportID = dbx.UUIDPtr(reportID)
+	return action, nil
+}
+
 func parseUUIDParam(w http.ResponseWriter, r *http.Request, name string) (uuid.UUID, bool) {
 	id, err := uuid.Parse(chi.URLParam(r, name))
 	if err != nil {
@@ -361,21 +658,6 @@ func parseUUIDParam(w http.ResponseWriter, r *http.Request, name string) (uuid.U
 		return uuid.Nil, false
 	}
 	return id, true
-}
-
-func parseLimit(r *http.Request, fallback int, max int) int {
-	value := strings.TrimSpace(r.URL.Query().Get("limit"))
-	if value == "" {
-		return fallback
-	}
-	parsed, err := strconv.Atoi(value)
-	if err != nil || parsed <= 0 {
-		return fallback
-	}
-	if parsed > max {
-		return max
-	}
-	return parsed
 }
 
 func normalizeReportState(value string) string {

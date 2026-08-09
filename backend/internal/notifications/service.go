@@ -21,15 +21,17 @@ const listNotificationsSQL = `
 SELECT id, actor_id, type, payload, read_at, created_at
 FROM notifications
 WHERE actor_id = $1
-ORDER BY created_at DESC
-LIMIT $2`
+  AND ($2::timestamptz IS NULL OR (created_at, id) < ($2, $3))
+ORDER BY created_at DESC, id DESC
+LIMIT $4`
 
 const listUnreadNotificationsSQL = `
 SELECT id, actor_id, type, payload, read_at, created_at
 FROM notifications
 WHERE actor_id = $1 AND read_at IS NULL
-ORDER BY created_at DESC
-LIMIT $2`
+  AND ($2::timestamptz IS NULL OR (created_at, id) < ($2, $3))
+ORDER BY created_at DESC, id DESC
+LIMIT $4`
 
 const unreadCountSQL = `
 SELECT COUNT(*)

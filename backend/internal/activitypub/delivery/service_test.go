@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	activitypub "basisvr-social-service/internal/activitypub"
 
@@ -50,6 +51,26 @@ func TestSignActivityRequestAddsRequiredActivityPubHeaders(t *testing.T) {
 	}
 	if !strings.Contains(signature, `headers="(request-target) host date digest"`) {
 		t.Fatalf("Signature missing signed headers: %s", signature)
+	}
+}
+
+func TestSignLegacyGETCoversTargetWithoutDigest(t *testing.T) {
+	keyPair, err := activitypub.GenerateActorKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://remote.example/users/alice?view=full", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SignLegacyRequest(req, "https://local.example/actor", keyPair.PrivateKeyPEM, nil, time.Now()); err != nil {
+		t.Fatalf("SignLegacyRequest returned error: %v", err)
+	}
+	if req.Header.Get("Digest") != "" {
+		t.Fatalf("Digest = %q", req.Header.Get("Digest"))
+	}
+	if signature := req.Header.Get("Signature"); !strings.Contains(signature, `headers="(request-target) host date"`) {
+		t.Fatalf("Signature = %q", signature)
 	}
 }
 
@@ -144,6 +165,51 @@ func TestWorkerDeliversDueJobAndMarksDelivered(t *testing.T) {
 	}
 	if received["type"] != "Accept" {
 		t.Fatalf("received activity type = %v", received["type"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkerRetriesRejectedLegacyDeliveryWithRFC9421(t *testing.T) {
+	keyPair, err := activitypub.GenerateActorKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempts := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			if r.Header.Get("Signature-Input") != "" {
+				t.Fatal("first delivery must use the legacy signature")
+			}
+			return &http.Response{StatusCode: http.StatusUnauthorized, Body: http.NoBody, Header: make(http.Header)}, nil
+		}
+		if r.Header.Get("Signature-Input") == "" || r.Header.Get("Content-Digest") == "" {
+			t.Fatalf("RFC 9421 headers are missing: %v", r.Header)
+		}
+		return &http.Response{StatusCode: http.StatusAccepted, Body: http.NoBody, Header: make(http.Header)}, nil
+	})}
+	db, mock := newMockDB(t)
+	jobID := uuid.New()
+	activityID := uuid.New()
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT j.id, j.activity_id").WillReturnRows(sqlmock.NewRows([]string{
+		"job_id", "activity_id", "target_inbox_url", "attempts", "raw_json", "activity_uri", "actor_uri", "private_key_pem_encrypted",
+	}).AddRow(jobID, activityID, "https://remote.example/inbox", 0,
+		[]byte(`{"id":"https://basis.example/activities/1","type":"Create"}`),
+		"https://basis.example/activities/1", "https://basis.example/users/bob", keyPair.PrivateKeyPEM))
+	mock.ExpectQuery(regexp.QuoteMeta(blockedDomainExistsSQL)).WithArgs("remote.example").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("UPDATE outbox_jobs").WithArgs(jobID).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	delivered, err := NewWorker(db, client, 6).DeliverDueOne(context.Background())
+	if err != nil || !delivered {
+		t.Fatalf("delivered = %v, error = %v", delivered, err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d", attempts)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

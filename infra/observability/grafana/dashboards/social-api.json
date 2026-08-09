@@ -1,0 +1,22 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {"type":"stat","title":"API request rate","id":1,"gridPos":{"h":8,"w":6,"x":0,"y":0},"targets":[{"expr":"sum(rate(basisvr_http_requests_total[5m]))","refId":"A"}]},
+    {"type":"stat","title":"5xx ratio","id":2,"gridPos":{"h":8,"w":6,"x":6,"y":0},"targets":[{"expr":"sum(rate(basisvr_http_requests_total{status=~\"5..\"}[5m])) / clamp_min(sum(rate(basisvr_http_requests_total[5m])), 0.001)","refId":"A"}]},
+    {"type":"stat","title":"Realtime subscribers","id":3,"gridPos":{"h":8,"w":6,"x":12,"y":0},"targets":[{"expr":"basisvr_realtime_active_subscribers","refId":"A"}]},
+    {"type":"stat","title":"Replay failures","id":4,"gridPos":{"h":8,"w":6,"x":18,"y":0},"targets":[{"expr":"increase(basisvr_realtime_replay_store_failures_total[1h])","refId":"A"}]},
+    {"type":"timeseries","title":"HTTP requests by status","id":5,"gridPos":{"h":9,"w":12,"x":0,"y":8},"targets":[{"expr":"sum by (status) (rate(basisvr_http_requests_total[5m]))","legendFormat":"{{status}}","refId":"A"}]},
+    {"type":"timeseries","title":"Realtime replay","id":6,"gridPos":{"h":9,"w":12,"x":12,"y":8},"targets":[{"expr":"rate(basisvr_realtime_replay_stored_total[5m])","legendFormat":"stored","refId":"A"},{"expr":"rate(basisvr_realtime_replay_delivered_total[5m])","legendFormat":"replayed","refId":"B"},{"expr":"rate(basisvr_realtime_replay_resync_required_total[5m])","legendFormat":"resync","refId":"C"}]},
+    {"type":"timeseries","title":"ActivityPub delivery queue","id":7,"gridPos":{"h":9,"w":12,"x":0,"y":17},"targets":[{"expr":"basisvr_activitypub_outbox_jobs","legendFormat":"{{state}}","refId":"A"}]},
+    {"type":"stat","title":"Oldest ActivityPub delivery","id":8,"gridPos":{"h":9,"w":6,"x":12,"y":17},"targets":[{"expr":"basisvr_activitypub_outbox_oldest_pending_seconds","refId":"A"}]},
+    {"type":"timeseries","title":"ActivityPub inbox","id":9,"gridPos":{"h":9,"w":6,"x":18,"y":17},"targets":[{"expr":"basisvr_activitypub_inbox_messages","legendFormat":"{{state}}","refId":"A"}]}
+  ],
+  "schemaVersion": 39,
+  "tags": ["basisvr", "social"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "title": "BasisVR Social API",
+  "uid": "basisvr-social-api",
+  "version": 1
+}

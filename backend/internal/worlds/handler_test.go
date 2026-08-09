@@ -78,7 +78,9 @@ SELECT w.id, w.slug, w.name, w.description, w.preview_url, w.launch_url, w.visib
        a.id, a.acct, a.display_name
 FROM worlds w
 JOIN actors a ON a.id = w.owner_actor_id
-WHERE w.id = $1`)).
+LEFT JOIN users owner_user ON owner_user.id = a.local_user_id
+WHERE w.id = $1
+  AND (a.local_user_id IS NULL OR owner_user.status = 'active')`)).
 		WithArgs(worldID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id",
@@ -133,7 +135,9 @@ SELECT w.id, w.slug, w.name, w.description, w.preview_url, w.launch_url, w.visib
        a.id, a.acct, a.display_name
 FROM worlds w
 JOIN actors a ON a.id = w.owner_actor_id
-WHERE w.slug = $1`)).
+LEFT JOIN users owner_user ON owner_user.id = a.local_user_id
+WHERE w.slug = $1
+  AND (a.local_user_id IS NULL OR owner_user.status = 'active')`)).
 		WithArgs("private-world").
 		WillReturnRows(worldRows().AddRow(
 			worldID,
@@ -173,7 +177,9 @@ SELECT w.id, w.slug, w.name, w.description, w.preview_url, w.launch_url, w.visib
        a.id, a.acct, a.display_name
 FROM worlds w
 JOIN actors a ON a.id = w.owner_actor_id
-WHERE w.slug = $1`)).
+LEFT JOIN users owner_user ON owner_user.id = a.local_user_id
+WHERE w.slug = $1
+  AND (a.local_user_id IS NULL OR owner_user.status = 'active')`)).
 		WithArgs("followers-world").
 		WillReturnRows(worldRows().AddRow(
 			worldID,

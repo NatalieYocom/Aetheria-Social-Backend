@@ -30,6 +30,18 @@ func TestEmbeddedOpenAPIContract(t *testing.T) {
 		"/api/v1/assets/search":                                      {"get"},
 		"/api/v1/worlds/{id}/assets":                                 {"get", "post"},
 		"/api/v1/realtime/events":                                    {"get"},
+		"/api/v1/moderation/reports":                                 {"get"},
+		"/api/v1/moderation/domain-blocks":                           {"get", "post"},
+		"/api/v1/worlds/{id}/instances":                              {"get"},
+		"/api/v1/admin/world-server-credentials":                     {"get", "post"},
+		"/api/v1/admin/instance-join-audit":                          {"get"},
+		"/api/v1/moderation/users/{actorId}/actions":                 {"post"},
+		"/api/v1/moderation/actions":                                 {"get"},
+		"/api/v1/groups":                                             {"get", "post"},
+		"/api/v1/groups/{id}/join":                                   {"post"},
+		"/api/v1/groups/{id}/members/{actorId}":                      {"patch"},
+		"/api/v1/groups/{id}/worlds":                                 {"get", "post"},
+		"/api/v1/ws":                                                 {"get"},
 	}
 	for path, methods := range required {
 		operations, ok := document.Paths[path]

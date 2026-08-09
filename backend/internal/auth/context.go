@@ -12,9 +12,10 @@ type contextKey string
 const principalContextKey contextKey = "principal"
 
 type Principal struct {
-	UserID   uuid.UUID
-	ActorID  uuid.UUID
-	Username string
+	UserID      uuid.UUID
+	ActorID     uuid.UUID
+	Username    string
+	AuthVersion int64
 }
 
 func ContextWithPrincipal(ctx context.Context, principal Principal) context.Context {

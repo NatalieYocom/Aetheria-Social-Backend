@@ -17,8 +17,16 @@ services:
 
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--save", "60", "1000"]
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   minio:
     image: minio/minio:latest
@@ -36,20 +44,33 @@ services:
     build:
       context: ./backend
     environment:
+      APP_ENV: development
       API_BIND: 0.0.0.0:8080
       PUBLIC_URL: http://localhost:8080
+      HTTP_READ_HEADER_TIMEOUT: 5s
+      HTTP_READ_TIMEOUT: 30s
+      HTTP_IDLE_TIMEOUT: 2m
+      HTTP_MAX_HEADER_BYTES: 1048576
+      HTTP_SHUTDOWN_TIMEOUT: 15s
       DATABASE_URL: postgres://basis:basis@postgres:5432/basis_social?sslmode=disable
       REDIS_URL: redis://redis:6379/0
       REALTIME_BUFFER_SIZE: 128
       REALTIME_BUS_BUFFER_SIZE: 1024
       REALTIME_REDIS_CHANNEL: basisvr:realtime:v1
       REALTIME_REDIS_PUBLISH_TIMEOUT: 2s
+      REALTIME_REPLAY_ENABLED: "true"
+      REALTIME_REPLAY_RETENTION: 24h
+      REALTIME_REPLAY_MAX_ENTRIES: 10000
+      REALTIME_REPLAY_LIMIT: 500
+      REALTIME_REPLAY_PREFIX: basisvr:realtime
+      REALTIME_REPLAY_STORE_TIMEOUT: 250ms
       PRESENCE_SWEEP_INTERVAL: 15s
       PRESENCE_SWEEP_BATCH_SIZE: 500
       MAX_REQUEST_BODY_BYTES: 8388608
       RATE_LIMIT_ENABLED: "true"
       RATE_LIMIT_REQUESTS: 600
       RATE_LIMIT_WINDOW: 1m
+      CORS_ALLOWED_ORIGINS: ""
       METRICS_ENABLED: "true"
       JSON_LOGS_ENABLED: "true"
       READINESS_TIMEOUT: 2s
@@ -73,7 +94,7 @@ services:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
       minio:
         condition: service_started
 
@@ -91,6 +112,65 @@ services:
       backend:
         condition: service_started
 
+  retention:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_URL: postgres://basis:basis@postgres:5432/basis_social?sslmode=disable
+      RETENTION_INTERVAL: 1h
+      RETENTION_BATCH_SIZE: 1000
+    command: ["/app/retention"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: ["observability"]
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=15d"]
+    volumes:
+      - ./infra/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      backend:
+        condition: service_started
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: basisvr-local
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./infra/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.158.0
+    profiles: ["observability"]
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./infra/observability/otel-collector.yml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "13133:13133"
+    restart: unless-stopped
+
 volumes:
   postgres_data:
+  redis_data:
   minio_data:
+  prometheus_data:
+  grafana_data:
