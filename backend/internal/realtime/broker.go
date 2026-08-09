@@ -3,7 +3,9 @@ package realtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,8 +25,20 @@ type EventBus interface {
 	Close() error
 }
 
+var ErrReplayUnavailable = errors.New("realtime replay is unavailable")
+
+type BrokerStats struct {
+	ReplayStored        int64
+	ReplayStoreFailures int64
+	ReplayRequests      int64
+	ReplayDelivered     int64
+	ReplayResyncs       int64
+	ActiveSubscribers   int64
+}
+
 type Event struct {
 	ID        string    `json:"id"`
+	Cursor    string    `json:"cursor,omitempty"`
 	Type      string    `json:"type"`
 	ActorID   uuid.UUID `json:"actorId"`
 	Payload   any       `json:"payload,omitempty"`
@@ -32,15 +46,23 @@ type Event struct {
 }
 
 type Broker struct {
-	mu          sync.RWMutex
-	nextSubID   uint64
-	bufferSize  int
-	busTopic    string
-	originID    string
-	busTimeout  time.Duration
-	busQueue    chan []byte
-	busEnabled  bool
-	subscribers map[uuid.UUID]map[uint64]chan Event
+	mu                  sync.RWMutex
+	nextSubID           uint64
+	bufferSize          int
+	busTopic            string
+	originID            string
+	busTimeout          time.Duration
+	busQueue            chan []byte
+	busEnabled          bool
+	replayStore         ReplayStore
+	replayTimeout       time.Duration
+	subscribers         map[uuid.UUID]map[uint64]chan Event
+	replayStored        atomic.Int64
+	replayStoreFailures atomic.Int64
+	replayRequests      atomic.Int64
+	replayDelivered     atomic.Int64
+	replayResyncs       atomic.Int64
+	activeSubscribers   atomic.Int64
 }
 
 type busEnvelope struct {
@@ -96,6 +118,7 @@ func (b *Broker) Subscribe(ctx context.Context, actorID uuid.UUID) (<-chan Event
 	}
 	b.subscribers[actorID][subID] = ch
 	b.mu.Unlock()
+	b.activeSubscribers.Add(1)
 
 	var once sync.Once
 	unsubscribe := func() {
@@ -111,6 +134,7 @@ func (b *Broker) Subscribe(ctx context.Context, actorID uuid.UUID) (<-chan Event
 				}
 			}
 			b.mu.Unlock()
+			b.activeSubscribers.Add(-1)
 		})
 	}
 
@@ -127,8 +151,72 @@ func (b *Broker) Publish(actorID uuid.UUID, event Event) {
 		return
 	}
 	event = normalizeEvent(actorID, event)
+	b.mu.RLock()
+	replayStore := b.replayStore
+	replayTimeout := b.replayTimeout
+	b.mu.RUnlock()
+	if replayStore != nil {
+		storeCtx, cancel := context.WithTimeout(context.Background(), replayTimeout)
+		storedEvent, err := replayStore.Append(storeCtx, actorID, event)
+		cancel()
+		if err == nil {
+			event = storedEvent
+			b.replayStored.Add(1)
+		} else {
+			b.replayStoreFailures.Add(1)
+		}
+	}
 	b.publishLocal(actorID, event)
 	b.queueBusPublish(actorID, event)
+}
+
+func (b *Broker) AttachReplayStore(store ReplayStore, timeout time.Duration) {
+	if b == nil || store == nil {
+		return
+	}
+	if timeout <= 0 {
+		timeout = 250 * time.Millisecond
+	}
+	b.mu.Lock()
+	b.replayStore = store
+	b.replayTimeout = timeout
+	b.mu.Unlock()
+}
+
+func (b *Broker) Replay(ctx context.Context, actorID uuid.UUID, after string, limit int) (ReplayResult, error) {
+	if b == nil || actorID == uuid.Nil {
+		return ReplayResult{}, ErrReplayUnavailable
+	}
+	b.mu.RLock()
+	store := b.replayStore
+	b.mu.RUnlock()
+	if store == nil {
+		return ReplayResult{}, ErrReplayUnavailable
+	}
+	b.replayRequests.Add(1)
+	result, err := store.Replay(ctx, actorID, after, limit)
+	if err != nil {
+		return ReplayResult{}, err
+	}
+	b.replayDelivered.Add(int64(len(result.Events)))
+	if result.Truncated {
+		b.replayResyncs.Add(1)
+	}
+	return result, nil
+}
+
+func (b *Broker) Stats() BrokerStats {
+	if b == nil {
+		return BrokerStats{}
+	}
+	return BrokerStats{
+		ReplayStored:        b.replayStored.Load(),
+		ReplayStoreFailures: b.replayStoreFailures.Load(),
+		ReplayRequests:      b.replayRequests.Load(),
+		ReplayDelivered:     b.replayDelivered.Load(),
+		ReplayResyncs:       b.replayResyncs.Load(),
+		ActiveSubscribers:   b.activeSubscribers.Load(),
+	}
 }
 
 func (b *Broker) AttachBus(ctx context.Context, bus EventBus) error {

@@ -15,6 +15,7 @@ import (
 	"basisvr-social-service/internal/auth"
 	"basisvr-social-service/internal/common/dbx"
 	"basisvr-social-service/internal/common/httpx"
+	"basisvr-social-service/internal/common/page"
 	"basisvr-social-service/internal/realtime"
 
 	"github.com/go-chi/chi/v5"
@@ -51,6 +52,22 @@ UPDATE world_server_credentials
 SET last_used_at = now()
 WHERE token_hash = $1 AND status = 'active'
 RETURNING id, name, allowed_world_id`
+
+const listWorldServerCredentialsSQL = `
+SELECT id, name, token_prefix, allowed_world_id, status, metadata,
+       last_used_at, revoked_at, created_at
+FROM world_server_credentials
+WHERE $1::timestamptz IS NULL OR (created_at, id) < ($1, $2)
+ORDER BY created_at DESC, id DESC
+LIMIT $3`
+
+const listInstanceJoinAuditSQL = `
+SELECT id, ticket_id, credential_id, actor_id, instance_id,
+       outcome, remote_ip, details, created_at
+FROM instance_join_audit
+WHERE $1::timestamptz IS NULL OR (created_at, id) < ($1, $2)
+ORDER BY created_at DESC, id DESC
+LIMIT $3`
 
 type issueJoinTicketRequest struct {
 	PresenceVisibility string         `json:"presenceVisibility"`
@@ -422,12 +439,14 @@ func (h *Handler) ListWorldServerCredentials(w http.ResponseWriter, r *http.Requ
 	if _, ok := h.requireAdmin(w, r); !ok {
 		return
 	}
-	rows, err := h.db.QueryContext(r.Context(), `
-SELECT id, name, token_prefix, allowed_world_id, status, metadata,
-       last_used_at, revoked_at, created_at
-FROM world_server_credentials
-ORDER BY created_at DESC
-LIMIT 200`)
+	requestPage, err := page.ParseRequest(r, 50, 100)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_pagination", err.Error())
+		return
+	}
+	cursorTime, cursorID := cursorTimeAndID(requestPage.Cursor)
+	rows, err := h.db.QueryContext(r.Context(), listWorldServerCredentialsSQL,
+		cursorTime, cursorID, requestPage.Limit+1)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "list_credentials_failed", err.Error())
 		return
@@ -446,7 +465,15 @@ LIMIT 200`)
 		httpx.WriteError(w, http.StatusInternalServerError, "list_credentials_failed", err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, items)
+	nextCursor := (*string)(nil)
+	if len(items) > requestPage.Limit {
+		last := items[requestPage.Limit-1]
+		nextCursor = page.NextCursor(page.Cursor{SortTime: last.CreatedAt, ID: last.ID})
+		items = items[:requestPage.Limit]
+	}
+	httpx.WriteJSON(w, http.StatusOK, page.Response[WorldServerCredentialResponse]{
+		Data: items, Pagination: page.Metadata{NextCursor: nextCursor, Limit: requestPage.Limit},
+	})
 }
 
 func (h *Handler) RevokeWorldServerCredential(w http.ResponseWriter, r *http.Request) {
@@ -478,12 +505,14 @@ func (h *Handler) ListInstanceJoinAudit(w http.ResponseWriter, r *http.Request) 
 	if _, ok := h.requireAdmin(w, r); !ok {
 		return
 	}
-	rows, err := h.db.QueryContext(r.Context(), `
-SELECT id, ticket_id, credential_id, actor_id, instance_id,
-       outcome, remote_ip, details, created_at
-FROM instance_join_audit
-ORDER BY created_at DESC
-LIMIT 200`)
+	requestPage, err := page.ParseRequest(r, 50, 100)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_pagination", err.Error())
+		return
+	}
+	cursorTime, cursorID := cursorTimeAndID(requestPage.Cursor)
+	rows, err := h.db.QueryContext(r.Context(), listInstanceJoinAuditSQL,
+		cursorTime, cursorID, requestPage.Limit+1)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "list_join_audit_failed", err.Error())
 		return
@@ -512,7 +541,15 @@ LIMIT 200`)
 		httpx.WriteError(w, http.StatusInternalServerError, "list_join_audit_failed", err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, items)
+	nextCursor := (*string)(nil)
+	if len(items) > requestPage.Limit {
+		last := items[requestPage.Limit-1]
+		nextCursor = page.NextCursor(page.Cursor{SortTime: last.CreatedAt, ID: last.ID})
+		items = items[:requestPage.Limit]
+	}
+	httpx.WriteJSON(w, http.StatusOK, page.Response[InstanceJoinAuditResponse]{
+		Data: items, Pagination: page.Metadata{NextCursor: nextCursor, Limit: requestPage.Limit},
+	})
 }
 
 func (h *Handler) authenticateWorldServer(w http.ResponseWriter, r *http.Request) (worldServerIdentity, bool) {

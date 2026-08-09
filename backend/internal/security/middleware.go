@@ -61,6 +61,44 @@ func Headers(next http.Handler) http.Handler {
 	})
 }
 
+func CORS(allowedOrigins []string) func(http.Handler) http.Handler {
+	allowed := make(map[string]struct{}, len(allowedOrigins))
+	for _, origin := range allowedOrigins {
+		origin = strings.TrimRight(strings.TrimSpace(origin), "/")
+		if origin != "" && origin != "*" {
+			allowed[origin] = struct{}{}
+		}
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := strings.TrimRight(strings.TrimSpace(r.Header.Get("Origin")), "/")
+			if origin == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if _, ok := allowed[origin]; !ok {
+				if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+					httpx.WriteError(w, http.StatusForbidden, "origin_not_allowed", "origin is not allowed")
+					return
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+			w.Header().Add("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID")
+			w.Header().Set("Access-Control-Max-Age", "600")
+			if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 func BodyLimit(maxBytes int64) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		if maxBytes <= 0 {

@@ -11,6 +11,7 @@ import (
 	"basisvr-social-service/internal/auth"
 	"basisvr-social-service/internal/config"
 	"basisvr-social-service/internal/events"
+	"basisvr-social-service/internal/groups"
 	"basisvr-social-service/internal/instances"
 	"basisvr-social-service/internal/invites"
 	"basisvr-social-service/internal/moderation"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 type Deps struct {
@@ -42,6 +44,11 @@ func NewRouter(deps Deps) http.Handler {
 	r.Use(versionedAPI)
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
+	if deps.Config.Observability.TracingEnabled {
+		r.Use(otelhttp.NewMiddleware("basisvr.http", otelhttp.WithFilter(func(r *http.Request) bool {
+			return r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && r.URL.Path != "/metrics"
+		})))
+	}
 	if deps.Config.Observability.JSONLogsEnabled {
 		r.Use(observability.RequestLogger(log.Writer()))
 	} else {
@@ -49,6 +56,7 @@ func NewRouter(deps Deps) http.Handler {
 	}
 	r.Use(middleware.Recoverer)
 	r.Use(security.Headers)
+	r.Use(security.CORS(deps.Config.Security.CORSAllowedOrigins))
 	r.Use(security.BodyLimit(deps.Config.Security.MaxRequestBodyBytes))
 	if deps.Config.Security.RateLimitEnabled {
 		r.Use(security.RateLimit(security.NewFixedWindowLimiter(security.FixedWindowConfig{
@@ -61,10 +69,11 @@ func NewRouter(deps Deps) http.Handler {
 		deps.Config.Auth.AccessTokenTTL,
 		deps.Config.Auth.RefreshTokenTTL,
 	)
-	authMiddleware := auth.Middleware(tokens)
-	r.Use(auth.OptionalMiddleware(tokens))
+	authMiddleware := auth.Middleware(tokens, deps.DB)
+	r.Use(auth.OptionalMiddleware(tokens, deps.DB))
+	var metrics *observability.Metrics
 	if deps.Config.Observability.MetricsEnabled {
-		metrics := observability.NewMetrics()
+		metrics = observability.NewMetrics()
 		r.Use(metrics.Middleware)
 		r.Get("/metrics", metrics.Handler().ServeHTTP)
 	}
@@ -75,7 +84,35 @@ func NewRouter(deps Deps) http.Handler {
 		BusTopic:       deps.Config.Realtime.RedisChannel,
 		PublishTimeout: deps.Config.Realtime.RedisPublishTimeout,
 	})
+	if metrics != nil {
+		metrics.SetRealtimeProvider(func() observability.RealtimeMetrics {
+			stats := realtimeBroker.Stats()
+			return observability.RealtimeMetrics{
+				ReplayStored: stats.ReplayStored, ReplayStoreFailures: stats.ReplayStoreFailures,
+				ReplayRequests: stats.ReplayRequests, ReplayDelivered: stats.ReplayDelivered,
+				ReplayResyncs: stats.ReplayResyncs, ActiveSubscribers: stats.ActiveSubscribers,
+			}
+		})
+		metrics.SetFederationProvider(observability.FederationMetricsProvider(deps.DB))
+	}
 	if deps.Config.Redis.URL != "" {
+		if deps.Config.Realtime.ReplayEnabled {
+			store, err := realtime.NewRedisReplayStore(deps.Config.Redis.URL, realtime.ReplayStoreConfig{
+				Prefix:     deps.Config.Realtime.ReplayPrefix,
+				Retention:  deps.Config.Realtime.ReplayRetention,
+				MaxEntries: deps.Config.Realtime.ReplayMaxEntries,
+			})
+			if err != nil {
+				log.Printf("realtime replay disabled: %v", err)
+			} else {
+				realtimeBroker.AttachReplayStore(store, deps.Config.Realtime.ReplayStoreTimeout)
+				go func() {
+					<-appCtx.Done()
+					_ = store.Close()
+				}()
+				log.Printf("realtime replay enabled with retention %s", deps.Config.Realtime.ReplayRetention)
+			}
+		}
 		if bus, err := realtime.NewRedisEventBus(deps.Config.Redis.URL); err != nil {
 			log.Printf("realtime redis disabled: %v", err)
 		} else if err := realtimeBroker.AttachBus(appCtx, bus); err != nil {
@@ -129,12 +166,15 @@ func NewRouter(deps Deps) http.Handler {
 	relationships.RegisterRoutes(r, relationships.NewHandler(deps.DB, realtimeBroker), authMiddleware)
 	worlds.RegisterRoutes(r, worlds.NewHandler(deps.DB, deps.Config.Server.PublicURL), authMiddleware)
 	events.RegisterRoutes(r, events.NewHandler(deps.DB, deps.Config.Server.PublicURL), authMiddleware)
+	groups.RegisterRoutes(r, groups.NewHandler(deps.DB, deps.Config.Server.PublicURL, realtimeBroker), authMiddleware)
 	instances.RegisterRoutes(r, instances.NewHandler(deps.DB, realtimeBroker), authMiddleware)
 	invites.RegisterRoutes(r, invites.NewHandler(deps.DB, realtimeBroker), authMiddleware)
-	moderation.RegisterRoutes(r, moderation.NewHandler(deps.DB), authMiddleware)
+	moderation.RegisterRoutes(r, moderation.NewHandler(deps.DB, realtimeBroker), authMiddleware)
 	notifications.RegisterRoutes(r, notifications.NewHandler(deps.DB, realtimeBroker), authMiddleware)
 	presence.RegisterRoutes(r, presence.NewHandler(deps.DB, realtimeBroker), authMiddleware)
-	realtime.RegisterRoutes(r, realtime.NewHandler(realtimeBroker), authMiddleware)
+	realtimeHandler := realtime.NewHandler(realtimeBroker, deps.Config.Security.CORSAllowedOrigins...).
+		SetReplayLimit(deps.Config.Realtime.ReplayLimit)
+	realtime.RegisterRoutes(r, realtimeHandler, authMiddleware)
 	assetcatalog.RegisterRoutes(r, assetcatalog.NewHandler(deps.DB, deps.Config.AssetCatalog), authMiddleware)
 	activitypub.RegisterRoutes(r, activitypub.NewHandler(deps.DB, deps.Config))
 

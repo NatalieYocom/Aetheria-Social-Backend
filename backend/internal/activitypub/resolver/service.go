@@ -11,9 +11,9 @@ import (
 	"net/url"
 	"strings"
 	"time"
-)
 
-var ErrNotImplemented = errors.New("remote actor resolver is not implemented in this MVP")
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+)
 
 type RemoteActor struct {
 	ActorURI          string
@@ -35,12 +35,6 @@ type Resolver interface {
 	ResolveActor(ctx context.Context, actorURI string) (RemoteActor, error)
 }
 
-type PlaceholderResolver struct{}
-
-func (PlaceholderResolver) ResolveActor(context.Context, string) (RemoteActor, error) {
-	return RemoteActor{}, ErrNotImplemented
-}
-
 type HTTPResolver struct {
 	client       *http.Client
 	maxBodyBytes int64
@@ -51,7 +45,7 @@ type LookupIPFunc func(context.Context, string) ([]net.IP, error)
 
 func NewHTTPResolver(client *http.Client, maxBodyBytes int64) HTTPResolver {
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		client = &http.Client{Timeout: 10 * time.Second, Transport: otelhttp.NewTransport(http.DefaultTransport)}
 	}
 	if maxBodyBytes <= 0 {
 		maxBodyBytes = 5 * 1024 * 1024

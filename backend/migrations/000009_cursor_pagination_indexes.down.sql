@@ -1,0 +1,15 @@
+DROP INDEX IF EXISTS instance_join_audit_created_id_cursor_idx;
+DROP INDEX IF EXISTS world_server_credentials_created_cursor_idx;
+DROP INDEX IF EXISTS instances_world_active_created_cursor_idx;
+DROP INDEX IF EXISTS domain_blocks_domain_cursor_idx;
+DROP INDEX IF EXISTS reports_state_created_cursor_idx;
+DROP INDEX IF EXISTS reports_reporter_created_cursor_idx;
+DROP INDEX IF EXISTS events_visibility_start_cursor_idx;
+DROP INDEX IF EXISTS worlds_visibility_created_cursor_idx;
+DROP INDEX IF EXISTS notifications_actor_unread_created_id_idx;
+DROP INDEX IF EXISTS notifications_actor_created_id_idx;
+DROP INDEX IF EXISTS invites_to_created_cursor_idx;
+DROP INDEX IF EXISTS invites_from_created_cursor_idx;
+DROP INDEX IF EXISTS relationships_list_cursor_idx;
+DROP INDEX IF EXISTS actors_acct_cursor_idx;
+DROP INDEX IF EXISTS users_active_username_cursor_idx;

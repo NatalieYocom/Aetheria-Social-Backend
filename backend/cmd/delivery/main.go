@@ -12,10 +12,25 @@ import (
 	"basisvr-social-service/internal/activitypub/delivery"
 	"basisvr-social-service/internal/config"
 	"basisvr-social-service/internal/database"
+	"basisvr-social-service/internal/observability"
 )
 
 func main() {
 	cfg := config.Load()
+	if cfg.Observability.TracingService == "basisvr-social-api" {
+		cfg.Observability.TracingService = "basisvr-social-delivery"
+	}
+	tracingShutdown, err := observability.InitTracing(context.Background(), cfg.Observability)
+	if err != nil {
+		log.Fatalf("initialize tracing: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tracingShutdown(ctx); err != nil {
+			log.Printf("shutdown tracing: %v", err)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	db, err := database.Open(ctx, cfg.Database)
 	cancel()

@@ -10,8 +10,10 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"basisvr-social-service/internal/activitypub/delivery"
+	"basisvr-social-service/internal/activitypub/messagesig"
 	"basisvr-social-service/internal/activitypub/resolver"
 	"basisvr-social-service/internal/config"
 
@@ -114,6 +116,61 @@ func TestPersonActorEndpointReturnsActivityStreamsPerson(t *testing.T) {
 	}
 }
 
+func TestServiceActorEndpointReturnsPublicServiceDocument(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newTestRouter(db)
+	mock.ExpectQuery("SELECT actor_uri, acct, preferred_username, display_name").
+		WithArgs("https://example.social/actor").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"actor_uri", "acct", "preferred_username", "display_name", "domain", "inbox_url", "outbox_url",
+			"followers_url", "following_url", "shared_inbox_url", "public_key_pem",
+		}).AddRow(
+			"https://example.social/actor", "instance@example.social", "instance", "BasisVR Social", "example.social",
+			"https://example.social/actor/inbox", "https://example.social/actor/outbox",
+			"https://example.social/actor/followers", "https://example.social/actor/following",
+			"https://example.social/inbox", "public-key",
+		))
+
+	req := httptest.NewRequest(http.MethodGet, "/actor", nil)
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["type"] != "Service" || body["id"] != "https://example.social/actor" {
+		t.Fatalf("body = %+v", body)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStrictAuthorizedFetchRejectsUnsignedActorGET(t *testing.T) {
+	db, _ := newMockDB(t)
+	r := chi.NewRouter()
+	RegisterRoutes(r, NewHandlerWithResolver(db, config.Config{
+		Server: config.ServerConfig{PublicURL: "https://example.social"},
+		ActivityPub: config.ActivityPubConfig{
+			Domain: "example.social", AuthorizedFetch: "all",
+		},
+	}, fakeResolver{err: errors.New("resolver should not be called without a signature")}))
+
+	res := httptest.NewRecorder()
+	r.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/users/alice", nil))
+
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	if res.Header().Get("WWW-Authenticate") == "" {
+		t.Fatal("WWW-Authenticate header is missing")
+	}
+}
+
 func TestFollowersCollectionReturnsOrderedCollection(t *testing.T) {
 	db, mock := newMockDB(t)
 	router := newTestRouter(db)
@@ -124,10 +181,10 @@ func TestFollowersCollectionReturnsOrderedCollection(t *testing.T) {
 		WithArgs("alice").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "actor_uri"}).
 			AddRow(actorID, "https://example.social/users/alice"))
-	mock.ExpectQuery("SELECT COUNT").
+	mock.ExpectQuery("(?s)SELECT COUNT.*JOIN actors target.*LEFT JOIN users target_user").
 		WithArgs(actorID).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	mock.ExpectQuery("SELECT target.actor_uri").
+	mock.ExpectQuery("(?s)SELECT target.actor_uri.*LEFT JOIN users target_user").
 		WithArgs(actorID).
 		WillReturnRows(sqlmock.NewRows([]string{"actor_uri"}).
 			AddRow("https://remote.example/users/bob"))
@@ -199,6 +256,119 @@ func TestOutboxReturnsStoredActivityObjects(t *testing.T) {
 	}
 }
 
+func TestActivityEndpointReturnsStoredActivity(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newTestRouter(db)
+	activityID := uuid.New()
+	mock.ExpectQuery("SELECT raw_json").
+		WithArgs(activityID).
+		WillReturnRows(sqlmock.NewRows([]string{"raw_json"}).AddRow([]byte(`{"id":"https://example.social/activities/1","type":"Create"}`)))
+
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/activities/"+activityID.String(), nil))
+
+	if res.Code != http.StatusOK || res.Header().Get("Content-Type") != activityJSONContentType {
+		t.Fatalf("status = %d, content-type = %q, body = %s", res.Code, res.Header().Get("Content-Type"), res.Body.String())
+	}
+}
+
+func TestObjectEndpointReturnsTombstoneForDeletedObject(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newTestRouter(db)
+	objectID := uuid.New()
+	mock.ExpectQuery("SELECT object_uri, type, raw_json, is_deleted").
+		WithArgs(objectID).
+		WillReturnRows(sqlmock.NewRows([]string{"object_uri", "type", "raw_json", "is_deleted"}).
+			AddRow("https://remote.example/notes/1", "Note", []byte(`{"id":"https://remote.example/notes/1","type":"Note"}`), true))
+
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/objects/"+objectID.String(), nil))
+
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"type":"Tombstone"`) {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+}
+
+func TestObjectEndpointDoesNotRehostNonPublicRemoteObject(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newTestRouter(db)
+	objectID := uuid.New()
+	mock.ExpectQuery("SELECT object_uri, type, raw_json, is_deleted").WithArgs(objectID).
+		WillReturnRows(sqlmock.NewRows([]string{"object_uri", "type", "raw_json", "is_deleted"}).AddRow(
+			"https://remote.example/notes/secret", "Note",
+			[]byte(`{"id":"https://remote.example/notes/secret","type":"Note","to":"https://remote.example/users/bob/followers"}`), false,
+		))
+
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/objects/"+objectID.String(), nil))
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+}
+
+func TestObjectEndpointReturnsPublicLocalWorld(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newTestRouter(db)
+	worldID := uuid.New()
+	ownerID := uuid.New()
+	mock.ExpectQuery("SELECT object_uri, type, raw_json, is_deleted").WithArgs(worldID).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery("FROM worlds w").WithArgs(worldID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"name", "description", "preview_url", "launch_url", "capacity", "owner_actor_id", "actor_uri", "visibility", "created_at", "updated_at",
+		}).AddRow("Moon", "VR world", "https://cdn.example/moon.png", "basis://world/moon", 32,
+			ownerID, "https://example.social/users/alice", "public", time.Now(), time.Now()))
+
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/objects/"+worldID.String(), nil))
+
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"type":"Page"`) || !strings.Contains(res.Body.String(), `"basis:objectType":"World"`) {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+}
+
+func TestObjectEndpointReturnsFollowersWorldToSignedAcceptedFollower(t *testing.T) {
+	db, mock := newMockDB(t)
+	worldID := uuid.New()
+	ownerID := uuid.New()
+	keyPair, err := GenerateActorKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteActorURI := "https://remote.example/users/bob"
+	router := newTestRouterWithResolver(db, fakeResolver{actor: resolver.RemoteActor{
+		ActorURI: remoteActorURI, PublicKeyPEM: keyPair.PublicKeyPEM, Domain: "remote.example",
+	}})
+	mock.ExpectQuery("SELECT object_uri, type, raw_json, is_deleted").WithArgs(worldID).WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery("FROM worlds w").WithArgs(worldID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"name", "description", "preview_url", "launch_url", "capacity", "owner_actor_id", "actor_uri", "visibility", "created_at", "updated_at",
+		}).AddRow("Followers Moon", "VR world", "", "basis://world/moon", 32, ownerID,
+			"https://example.social/users/alice", "followers", time.Now(), time.Now()))
+	mock.ExpectQuery(regexp.QuoteMeta(federationBlockedDomainExistsSQL)).WithArgs("remote.example").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectQuery("SELECT actor_uri, domain, public_key_pem").WithArgs(remoteActorURI).
+		WillReturnRows(sqlmock.NewRows([]string{"actor_uri", "domain", "public_key_pem"}).
+			AddRow(remoteActorURI, "remote.example", keyPair.PublicKeyPEM))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs(ownerID, remoteActorURI).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	target := "https://example.social/objects/" + worldID.String()
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	if err := messagesig.SignRequest(req, nil, remoteActorURI+"#main-key", mustParseTestPrivateKey(t, keyPair.PrivateKeyPEM), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"name":"Followers Moon"`) {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestInboxStoresAcceptedActivityEnvelope(t *testing.T) {
 	db, mock := newMockDB(t)
 	router := newTestRouter(db)
@@ -212,13 +382,13 @@ func TestInboxStoresAcceptedActivityEnvelope(t *testing.T) {
 		WithArgs("remote.example").
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectExec("INSERT INTO inbox_messages").
-		WithArgs(recipientID, "https://remote.example/activities/like-1", "Like", sqlmock.AnyArg()).
+		WithArgs(recipientID, "https://remote.example/activities/flag-1", "Flag", sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/users/alice/inbox",
-		strings.NewReader(`{"id":"https://remote.example/activities/like-1","type":"Like","actor":"https://remote.example/users/bob"}`),
+		strings.NewReader(`{"id":"https://remote.example/activities/flag-1","type":"Flag","actor":"https://remote.example/users/bob"}`),
 	)
 	req.Header.Set("Content-Type", "application/activity+json")
 	res := httptest.NewRecorder()
@@ -226,6 +396,37 @@ func TestInboxStoresAcceptedActivityEnvelope(t *testing.T) {
 	router.ServeHTTP(res, req)
 
 	if res.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSharedInboxRoutesActivityToLocalRecipient(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newTestRouter(db)
+	recipientID := uuid.New()
+	localActorURI := "https://example.social/users/alice"
+
+	mock.ExpectQuery("SELECT id, actor_uri").
+		WithArgs(localActorURI).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "actor_uri"}).AddRow(recipientID, localActorURI))
+	mock.ExpectQuery(regexp.QuoteMeta(federationBlockedDomainExistsSQL)).
+		WithArgs("remote.example").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("INSERT INTO inbox_messages").
+		WithArgs(recipientID, "https://remote.example/activities/flag-2", "Flag", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	req := httptest.NewRequest(http.MethodPost, "/inbox", strings.NewReader(
+		`{"id":"https://remote.example/activities/flag-2","type":"Flag","actor":"https://remote.example/users/bob","to":["`+localActorURI+`"]}`,
+	))
+	req.Header.Set("Content-Type", "application/activity+json")
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+
+	if res.Code != http.StatusAccepted || !strings.Contains(res.Body.String(), `"recipients":1`) {
 		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -389,6 +590,97 @@ func TestInboxFollowCreatesRemoteActorRelationshipAndAcceptActivity(t *testing.T
 	}
 	if body["processingState"] != "processed" {
 		t.Fatalf("processingState = %v", body["processingState"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRicherInboxActivitiesRequireHTTPSignature(t *testing.T) {
+	for _, activityType := range []string{"Create", "Update", "Delete", "Announce", "Like", "Accept", "Reject"} {
+		t.Run(activityType, func(t *testing.T) {
+			if !requiresInboxHTTPSignature(activityType, map[string]any{"type": activityType}) {
+				t.Fatalf("%s must require an HTTP Signature", activityType)
+			}
+		})
+	}
+	if !requiresInboxHTTPSignature("Undo", map[string]any{
+		"type": "Undo", "object": map[string]any{"type": "Like"},
+	}) {
+		t.Fatal("Undo Like must require an HTTP Signature")
+	}
+}
+
+func TestFederatedObjectRejectsAttributionMismatch(t *testing.T) {
+	_, err := federatedObjectFromActivity(map[string]any{
+		"type":  "Create",
+		"actor": "https://remote.example/users/bob",
+		"object": map[string]any{
+			"id": "https://remote.example/notes/1", "type": "Note",
+			"attributedTo": "https://other.example/users/eve",
+		},
+	}, "https://remote.example/users/bob")
+	if !errors.Is(err, errObjectOwnershipMismatch) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestFederatedObjectRequiresID(t *testing.T) {
+	_, err := federatedObjectFromActivity(map[string]any{
+		"type": "Create", "object": map[string]any{"type": "Note"},
+	}, "https://remote.example/users/bob")
+	if !errors.Is(err, errInvalidFederatedObject) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestInboxStoresSignedCreateAsProcessedFederatedActivity(t *testing.T) {
+	db, mock := newMockDB(t)
+	localActorID := uuid.New()
+	remoteActorID := uuid.New()
+	keyPair, err := GenerateActorKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	actorURI := "https://remote.example/users/bob"
+	activityURI := "https://remote.example/activities/create-1"
+	objectURI := "https://remote.example/notes/1"
+	router := newTestRouterWithResolver(db, fakeResolver{err: errors.New("resolver should not be called")})
+
+	mock.ExpectQuery(regexp.QuoteMeta(actorIDByUsernameSelect())).
+		WithArgs("alice").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "actor_uri"}).AddRow(localActorID, "https://example.social/users/alice"))
+	mock.ExpectQuery(regexp.QuoteMeta(federationBlockedDomainExistsSQL)).
+		WithArgs("remote.example").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT id, actor_uri").
+		WithArgs(actorURI).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "actor_uri", "acct", "type", "preferred_username", "display_name", "domain",
+			"inbox_url", "outbox_url", "followers_url", "following_url", "shared_inbox_url", "public_key_pem",
+		}).AddRow(
+			remoteActorID, actorURI, "bob@remote.example", "Person", "bob", "Bob", "remote.example",
+			actorURI+"/inbox", actorURI+"/outbox", actorURI+"/followers", actorURI+"/following", "", keyPair.PublicKeyPEM,
+		))
+	mock.ExpectExec("INSERT INTO inbox_messages").
+		WithArgs(localActorID, remoteActorID, activityURI, "Create", sqlmock.AnyArg(), true).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec("INSERT INTO activitypub_objects").
+		WithArgs(objectURI, remoteActorID, "Note", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec("INSERT INTO activities").
+		WithArgs(activityURI, remoteActorID, "Create", objectURI, "Note", "public", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	body := []byte(`{"@context":"https://www.w3.org/ns/activitystreams","id":"` + activityURI + `","type":"Create","actor":"` + actorURI + `","to":["https://www.w3.org/ns/activitystreams#Public"],"object":{"id":"` + objectURI + `","type":"Note","content":"hello"}}`)
+	req := signedActivityRequest(t, "https://example.social/users/alice/inbox", actorURI, keyPair.PrivateKeyPEM, body)
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+
+	if res.Code != http.StatusAccepted || !strings.Contains(res.Body.String(), `"processingState":"processed"`) {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

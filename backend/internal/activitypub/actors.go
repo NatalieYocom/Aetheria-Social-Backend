@@ -35,15 +35,23 @@ type ActorMetadata struct {
 }
 
 func BuildLocalActorMetadata(input LocalActorInput) ActorMetadata {
+	return buildLocalActorMetadata(input, "users", "Person")
+}
+
+func BuildLocalGroupActorMetadata(input LocalActorInput) ActorMetadata {
+	return buildLocalActorMetadata(input, "groups", "Group")
+}
+
+func buildLocalActorMetadata(input LocalActorInput, path, actorType string) ActorMetadata {
 	base := strings.TrimRight(input.PublicURL, "/")
 	username := strings.TrimSpace(input.Username)
-	actorURI := base + "/users/" + url.PathEscape(username)
+	actorURI := base + "/" + path + "/" + url.PathEscape(username)
 	domain := hostFromURL(base)
 
 	return ActorMetadata{
 		ActorURI:            actorURI,
 		Acct:                username + "@" + domain,
-		Type:                "Person",
+		Type:                actorType,
 		PreferredUsername:   username,
 		DisplayName:         input.DisplayName,
 		Summary:             input.Bio,
@@ -61,6 +69,21 @@ func BuildLocalActorMetadata(input LocalActorInput) ActorMetadata {
 }
 
 func BuildPersonActorDocument(meta ActorMetadata) map[string]any {
+	meta.Type = "Person"
+	return buildActorDocument(meta)
+}
+
+func BuildGroupActorDocument(meta ActorMetadata) map[string]any {
+	meta.Type = "Group"
+	return buildActorDocument(meta)
+}
+
+func BuildServiceActorDocument(meta ActorMetadata) map[string]any {
+	meta.Type = "Service"
+	return buildActorDocument(meta)
+}
+
+func buildActorDocument(meta ActorMetadata) map[string]any {
 	doc := map[string]any{
 		"@context": []any{
 			"https://www.w3.org/ns/activitystreams",
@@ -68,7 +91,7 @@ func BuildPersonActorDocument(meta ActorMetadata) map[string]any {
 			map[string]any{"basis": "https://basis.social/ns#"},
 		},
 		"id":                meta.ActorURI,
-		"type":              "Person",
+		"type":              meta.Type,
 		"preferredUsername": meta.PreferredUsername,
 		"name":              meta.DisplayName,
 		"summary":           meta.Summary,
@@ -101,6 +124,9 @@ func BuildPersonActorDocument(meta ActorMetadata) map[string]any {
 func publicProfileURL(meta ActorMetadata) string {
 	if meta.ActorURI == "" || meta.PreferredUsername == "" {
 		return ""
+	}
+	if meta.Type == "Group" || meta.Type == "Service" {
+		return meta.ActorURI
 	}
 	base := strings.TrimSuffix(meta.ActorURI, "/users/"+url.PathEscape(meta.PreferredUsername))
 	if base == meta.ActorURI {

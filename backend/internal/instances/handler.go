@@ -11,6 +11,7 @@ import (
 	"basisvr-social-service/internal/auth"
 	"basisvr-social-service/internal/common/dbx"
 	"basisvr-social-service/internal/common/httpx"
+	"basisvr-social-service/internal/common/page"
 	"basisvr-social-service/internal/privacy"
 	"basisvr-social-service/internal/realtime"
 
@@ -140,12 +141,51 @@ SELECT id, world_id, host_actor_id, instance_key, name, visibility, launch_url, 
 FROM instances
 WHERE id = $1`
 
+const listWorldInstancesSQL = `
+SELECT i.id, i.world_id, i.host_actor_id, i.instance_key, i.name, i.visibility, i.launch_url,
+       i.capacity, i.current_users, i.status, i.expires_at, i.metadata, i.created_at
+FROM instances i
+JOIN actors host_actor ON host_actor.id = i.host_actor_id
+LEFT JOIN users host_user ON host_user.id = host_actor.local_user_id
+WHERE i.world_id = $1
+  AND i.status = 'active'
+  AND (host_actor.local_user_id IS NULL OR host_user.status = 'active')
+  AND (
+    i.visibility = 'public'
+    OR ($2::uuid IS NOT NULL AND (
+      i.host_actor_id = $2
+      OR (i.visibility = 'friends' AND EXISTS (
+        SELECT 1 FROM relationships rel
+        WHERE rel.actor_id = $2
+          AND rel.target_actor_id = i.host_actor_id
+          AND rel.type = 'friend'
+          AND rel.state = 'accepted'
+      ))
+      OR (i.visibility = 'invite_only' AND EXISTS (
+        SELECT 1 FROM invites inv
+        WHERE inv.to_actor_id = $2
+          AND inv.instance_id = i.id
+          AND inv.state IN ('pending', 'accepted')
+          AND inv.expires_at > now()
+      ))
+    ))
+  )
+  AND ($3::timestamptz IS NULL OR (i.created_at, i.id) < ($3, $4))
+ORDER BY i.created_at DESC, i.id DESC
+LIMIT $5`
+
 const heartbeatInstanceSelectSQL = `
 SELECT world_id, status, expires_at
 FROM instances
 WHERE id = $1`
 
-const worldAccessTargetSQL = `SELECT owner_actor_id, visibility FROM worlds WHERE id = $1`
+const worldAccessTargetSQL = `
+SELECT w.owner_actor_id, w.visibility
+FROM worlds w
+JOIN actors owner_actor ON owner_actor.id = w.owner_actor_id
+LEFT JOIN users owner_user ON owner_user.id = owner_actor.local_user_id
+WHERE w.id = $1
+  AND (owner_actor.local_user_id IS NULL OR owner_user.status = 'active')`
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	principal, err := auth.RequirePrincipal(r.Context())
@@ -750,41 +790,69 @@ func (h *Handler) ListByWorld(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	allowed, err := h.canViewWorldByID(r.Context(), worldID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			httpx.WriteError(w, http.StatusNotFound, "not_found", "world not found")
+			return
+		}
+		httpx.WriteError(w, http.StatusInternalServerError, "world_access_check_failed", err.Error())
+		return
+	}
+	if !allowed {
+		httpx.WriteError(w, http.StatusNotFound, "not_found", "world not found")
+		return
+	}
+	requestPage, err := page.ParseRequest(r, 50, 100)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_pagination", err.Error())
+		return
+	}
+	viewerID := viewerActorID(r.Context())
+	var viewerArg any
+	if viewerID.Valid {
+		viewerArg = viewerID.UUID
+	}
+	cursorTime, cursorID := cursorTimeAndID(requestPage.Cursor)
 
-	rows, err := h.db.QueryContext(r.Context(), `
-SELECT id, world_id, host_actor_id, instance_key, name, visibility, launch_url, capacity, current_users, status, expires_at, metadata
-FROM instances
-WHERE world_id = $1 AND status = 'active'
-ORDER BY created_at DESC
-LIMIT 100`, worldID)
+	rows, err := h.db.QueryContext(r.Context(), listWorldInstancesSQL,
+		worldID, viewerArg, cursorTime, cursorID, requestPage.Limit+1)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "list_instances_failed", err.Error())
 		return
 	}
 	defer rows.Close()
 
-	instances := []InstanceResponse{}
+	type listedInstance struct {
+		instance  InstanceResponse
+		createdAt time.Time
+	}
+	listed := []listedInstance{}
 	for rows.Next() {
-		instance, err := scanInstance(rows)
+		instance, createdAt, err := scanListedInstance(rows)
 		if err != nil {
 			httpx.WriteError(w, http.StatusInternalServerError, "scan_instance_failed", err.Error())
 			return
 		}
-		allowed, err := h.canViewInstance(r.Context(), instance)
-		if err != nil {
-			httpx.WriteError(w, http.StatusInternalServerError, "instance_access_check_failed", err.Error())
-			return
-		}
-		if !allowed {
-			continue
-		}
-		instances = append(instances, instance)
+		listed = append(listed, listedInstance{instance: instance, createdAt: createdAt})
 	}
 	if err := rows.Err(); err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "list_instances_failed", err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, instances)
+	nextCursor := (*string)(nil)
+	if len(listed) > requestPage.Limit {
+		last := listed[requestPage.Limit-1]
+		nextCursor = page.NextCursor(page.Cursor{SortTime: last.createdAt, ID: last.instance.ID})
+		listed = listed[:requestPage.Limit]
+	}
+	instances := make([]InstanceResponse, 0, len(listed))
+	for _, item := range listed {
+		instances = append(instances, item.instance)
+	}
+	httpx.WriteJSON(w, http.StatusOK, page.Response[InstanceResponse]{
+		Data: instances, Pagination: page.Metadata{NextCursor: nextCursor, Limit: requestPage.Limit},
+	})
 }
 
 func (h *Handler) isHost(ctx context.Context, instanceID uuid.UUID, actorID uuid.UUID) bool {
@@ -1029,6 +1097,42 @@ func scanInstance(row scanner) (InstanceResponse, error) {
 	}
 	instance.Metadata = dbx.DecodeJSON(metadataRaw, map[string]any{})
 	return instance, nil
+}
+
+func scanListedInstance(row scanner) (InstanceResponse, time.Time, error) {
+	var instance InstanceResponse
+	var expiresAt sql.NullTime
+	var metadataRaw []byte
+	var createdAt time.Time
+	if err := row.Scan(
+		&instance.ID,
+		&instance.WorldID,
+		&instance.HostActorID,
+		&instance.InstanceKey,
+		&instance.Name,
+		&instance.Visibility,
+		&instance.LaunchURL,
+		&instance.Capacity,
+		&instance.CurrentUsers,
+		&instance.Status,
+		&expiresAt,
+		&metadataRaw,
+		&createdAt,
+	); err != nil {
+		return InstanceResponse{}, time.Time{}, err
+	}
+	if expiresAt.Valid {
+		instance.ExpiresAt = &expiresAt.Time
+	}
+	instance.Metadata = dbx.DecodeJSON(metadataRaw, map[string]any{})
+	return instance, createdAt, nil
+}
+
+func cursorTimeAndID(cursor *page.Cursor) (any, uuid.UUID) {
+	if cursor == nil {
+		return nil, uuid.Nil
+	}
+	return cursor.SortTime, cursor.ID
 }
 
 func parseUUIDParam(w http.ResponseWriter, r *http.Request, name string) (uuid.UUID, bool) {

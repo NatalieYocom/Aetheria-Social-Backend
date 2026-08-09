@@ -1,6 +1,9 @@
 package config_test
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +13,11 @@ import (
 func TestLoadBuildsConfigFromEnvironment(t *testing.T) {
 	t.Setenv("API_BIND", "127.0.0.1:9090")
 	t.Setenv("PUBLIC_URL", "https://social.example")
+	t.Setenv("HTTP_READ_HEADER_TIMEOUT", "4s")
+	t.Setenv("HTTP_READ_TIMEOUT", "25s")
+	t.Setenv("HTTP_IDLE_TIMEOUT", "90s")
+	t.Setenv("HTTP_MAX_HEADER_BYTES", "524288")
+	t.Setenv("HTTP_SHUTDOWN_TIMEOUT", "12s")
 	t.Setenv("DATABASE_URL", "postgres://basis:basis@localhost:5432/basis_social?sslmode=disable")
 	t.Setenv("REDIS_URL", "redis://localhost:6379/1")
 	t.Setenv("JWT_SECRET", "test-secret")
@@ -17,6 +25,7 @@ func TestLoadBuildsConfigFromEnvironment(t *testing.T) {
 	t.Setenv("REFRESH_TOKEN_TTL", "720h")
 	t.Setenv("REGISTRATION_ENABLED", "false")
 	t.Setenv("FEDERATION_MODE", "disabled")
+	t.Setenv("ACTIVITYPUB_AUTHORIZED_FETCH", "all")
 	t.Setenv("ASSET_CATALOG_ENABLED", "true")
 	t.Setenv("ASSET_CATALOG_CODE", "beeba")
 	t.Setenv("ASSET_CATALOG_NAME", "BeeBa Asset Catalog")
@@ -29,12 +38,19 @@ func TestLoadBuildsConfigFromEnvironment(t *testing.T) {
 	t.Setenv("REALTIME_BUS_BUFFER_SIZE", "2048")
 	t.Setenv("REALTIME_REDIS_CHANNEL", "basisvr:test:realtime")
 	t.Setenv("REALTIME_REDIS_PUBLISH_TIMEOUT", "750ms")
+	t.Setenv("REALTIME_REPLAY_ENABLED", "true")
+	t.Setenv("REALTIME_REPLAY_RETENTION", "12h")
+	t.Setenv("REALTIME_REPLAY_MAX_ENTRIES", "2500")
+	t.Setenv("REALTIME_REPLAY_LIMIT", "200")
+	t.Setenv("REALTIME_REPLAY_PREFIX", "basisvr:test:history")
+	t.Setenv("REALTIME_REPLAY_STORE_TIMEOUT", "400ms")
 	t.Setenv("PRESENCE_SWEEP_INTERVAL", "5s")
 	t.Setenv("PRESENCE_SWEEP_BATCH_SIZE", "50")
 	t.Setenv("MAX_REQUEST_BODY_BYTES", "1048576")
 	t.Setenv("RATE_LIMIT_ENABLED", "true")
 	t.Setenv("RATE_LIMIT_REQUESTS", "120")
 	t.Setenv("RATE_LIMIT_WINDOW", "30s")
+	t.Setenv("CORS_ALLOWED_ORIGINS", "https://beeba.example, https://app.example")
 	t.Setenv("METRICS_ENABLED", "true")
 	t.Setenv("JSON_LOGS_ENABLED", "true")
 	t.Setenv("READINESS_TIMEOUT", "1500ms")
@@ -46,6 +62,12 @@ func TestLoadBuildsConfigFromEnvironment(t *testing.T) {
 	}
 	if cfg.Server.PublicURL != "https://social.example" {
 		t.Fatalf("Server.PublicURL = %q", cfg.Server.PublicURL)
+	}
+	if cfg.Server.ReadHeaderTimeout != 4*time.Second || cfg.Server.ReadTimeout != 25*time.Second || cfg.Server.IdleTimeout != 90*time.Second {
+		t.Fatalf("HTTP server timeouts = %+v", cfg.Server)
+	}
+	if cfg.Server.MaxHeaderBytes != 524288 || cfg.Server.ShutdownTimeout != 12*time.Second {
+		t.Fatalf("HTTP server limits = %+v", cfg.Server)
 	}
 	if cfg.Database.URL == "" {
 		t.Fatal("Database.URL should be loaded")
@@ -80,6 +102,9 @@ func TestLoadBuildsConfigFromEnvironment(t *testing.T) {
 	if cfg.Security.RateLimitWindow != 30*time.Second {
 		t.Fatalf("RateLimitWindow = %s", cfg.Security.RateLimitWindow)
 	}
+	if len(cfg.Security.CORSAllowedOrigins) != 2 || cfg.Security.CORSAllowedOrigins[0] != "https://beeba.example" {
+		t.Fatalf("CORSAllowedOrigins = %#v", cfg.Security.CORSAllowedOrigins)
+	}
 	if !cfg.Observability.MetricsEnabled {
 		t.Fatal("MetricsEnabled should be true")
 	}
@@ -91,6 +116,9 @@ func TestLoadBuildsConfigFromEnvironment(t *testing.T) {
 	}
 	if cfg.ActivityPub.Domain != "social.example" {
 		t.Fatalf("ActivityPub.Domain = %q", cfg.ActivityPub.Domain)
+	}
+	if cfg.ActivityPub.AuthorizedFetch != "all" {
+		t.Fatalf("ActivityPub.AuthorizedFetch = %q", cfg.ActivityPub.AuthorizedFetch)
 	}
 	if !cfg.AssetCatalog.Enabled {
 		t.Fatal("AssetCatalog.Enabled should be true")
@@ -128,10 +156,81 @@ func TestLoadBuildsConfigFromEnvironment(t *testing.T) {
 	if cfg.Realtime.RedisPublishTimeout != 750*time.Millisecond {
 		t.Fatalf("Realtime.RedisPublishTimeout = %s", cfg.Realtime.RedisPublishTimeout)
 	}
+	if !cfg.Realtime.ReplayEnabled || cfg.Realtime.ReplayRetention != 12*time.Hour {
+		t.Fatalf("Realtime replay enable/retention = %+v", cfg.Realtime)
+	}
+	if cfg.Realtime.ReplayMaxEntries != 2500 || cfg.Realtime.ReplayLimit != 200 {
+		t.Fatalf("Realtime replay limits = %+v", cfg.Realtime)
+	}
+	if cfg.Realtime.ReplayPrefix != "basisvr:test:history" || cfg.Realtime.ReplayStoreTimeout != 400*time.Millisecond {
+		t.Fatalf("Realtime replay storage = %+v", cfg.Realtime)
+	}
 	if cfg.Presence.SweepInterval != 5*time.Second {
 		t.Fatalf("Presence.SweepInterval = %s", cfg.Presence.SweepInterval)
 	}
 	if cfg.Presence.SweepBatchSize != 50 {
 		t.Fatalf("Presence.SweepBatchSize = %d", cfg.Presence.SweepBatchSize)
+	}
+}
+
+func TestValidateRejectsUnsafeProductionConfiguration(t *testing.T) {
+	cfg := config.Config{
+		Environment: "production",
+		Server:      config.ServerConfig{PublicURL: "http://social.example"},
+		Database:    config.DatabaseConfig{URL: "postgres://basis:basis@db/basis?sslmode=disable"},
+		Auth:        config.AuthConfig{JWTSecret: "dev-secret-change-me"},
+		Redis:       config.RedisConfig{URL: ""},
+		Realtime:    config.RealtimeConfig{ReplayEnabled: true},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected unsafe production config to be rejected")
+	}
+	for _, expected := range []string{"PUBLIC_URL", "JWT_SECRET", "DATABASE_URL", "REDIS_URL"} {
+		if !strings.Contains(err.Error(), expected) {
+			t.Fatalf("error %q does not mention %s", err, expected)
+		}
+	}
+}
+
+func TestValidateAcceptsProductionConfiguration(t *testing.T) {
+	cfg := config.Config{
+		Environment: "production",
+		Server:      config.ServerConfig{PublicURL: "https://social.example"},
+		Database:    config.DatabaseConfig{URL: "postgres://basis:secret@db/basis?sslmode=require"},
+		Auth:        config.AuthConfig{JWTSecret: strings.Repeat("a", 48)},
+		Redis:       config.RedisConfig{URL: "rediss://redis.example:6380/0"},
+		Realtime:    config.RealtimeConfig{ReplayEnabled: true},
+		ActivityPub: config.ActivityPubConfig{Enabled: true, Domain: "social.example", AuthorizedFetch: "protected"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateRejectsUnknownAuthorizedFetchModeInProduction(t *testing.T) {
+	cfg := config.Config{
+		Environment: "production",
+		Server:      config.ServerConfig{PublicURL: "https://social.example"},
+		Database:    config.DatabaseConfig{URL: "postgres://basis:secret@db/basis?sslmode=require"},
+		Auth:        config.AuthConfig{JWTSecret: strings.Repeat("a", 48)},
+		ActivityPub: config.ActivityPubConfig{Enabled: true, Domain: "social.example", AuthorizedFetch: "sometimes"},
+	}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "ACTIVITYPUB_AUTHORIZED_FETCH") {
+		t.Fatalf("Validate error = %v", err)
+	}
+}
+
+func TestLoadReadsSensitiveValuesFromFiles(t *testing.T) {
+	dir := t.TempDir()
+	secretFile := filepath.Join(dir, "jwt")
+	if err := os.WriteFile(secretFile, []byte("file-backed-secret-value"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("JWT_SECRET", "environment-value")
+	t.Setenv("JWT_SECRET_FILE", secretFile)
+	if got := config.Load().Auth.JWTSecret; got != "file-backed-secret-value" {
+		t.Fatalf("JWT secret = %q", got)
 	}
 }

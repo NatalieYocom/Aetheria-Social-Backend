@@ -9,8 +9,10 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"basisvr-social-service/internal/auth"
+	"basisvr-social-service/internal/common/page"
 	"basisvr-social-service/internal/realtime"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -231,21 +233,25 @@ func TestGetPrivateInstanceWithoutViewerReturnsNotFound(t *testing.T) {
 	}
 }
 
-func TestListByWorldFiltersPrivateInstancesForAnonymousViewer(t *testing.T) {
+func TestListByWorldAppliesVisibilityBeforeCursorPagination(t *testing.T) {
 	db, mock := newMockDB(t)
 	router := newTestRouter(db)
 	worldID := uuid.New()
 	hostID := uuid.New()
-	publicID := uuid.New()
-	privateID := uuid.New()
+	firstID := uuid.New()
+	secondID := uuid.New()
+	createdAt := time.Now().UTC().Truncate(time.Microsecond)
 
-	mock.ExpectQuery("FROM instances").
+	mock.ExpectQuery(regexp.QuoteMeta(worldAccessTargetSQL)).
 		WithArgs(worldID).
-		WillReturnRows(instanceRows().
-			AddRow(publicID, worldID, hostID, "public-key", "Public Instance", "public", "basis://join/public", 8, 0, "active", nil, []byte(`{}`)).
-			AddRow(privateID, worldID, hostID, "private-key", "Private Instance", "private", "basis://join/private", 8, 0, "active", nil, []byte(`{}`)))
+		WillReturnRows(sqlmock.NewRows([]string{"owner_actor_id", "visibility"}).AddRow(hostID, "public"))
+	mock.ExpectQuery(regexp.QuoteMeta(listWorldInstancesSQL)).
+		WithArgs(worldID, nil, nil, uuid.Nil, 2).
+		WillReturnRows(listInstanceRows().
+			AddRow(firstID, worldID, hostID, "public-one", "Public One", "public", "basis://join/one", 8, 0, "active", nil, []byte(`{}`), createdAt).
+			AddRow(secondID, worldID, hostID, "public-two", "Public Two", "public", "basis://join/two", 8, 0, "active", nil, []byte(`{}`), createdAt.Add(-time.Second)))
 
-	req := httptest.NewRequest(http.MethodGet, "/api/worlds/"+worldID.String()+"/instances", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/worlds/"+worldID.String()+"/instances?limit=1", nil)
 	res := httptest.NewRecorder()
 
 	router.ServeHTTP(res, req)
@@ -253,12 +259,35 @@ func TestListByWorldFiltersPrivateInstancesForAnonymousViewer(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
 	}
-	var body []InstanceResponse
+	var body page.Response[InstanceResponse]
 	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if len(body) != 1 || body[0].ID != publicID {
+	if len(body.Data) != 1 || body.Data[0].ID != firstID || body.Pagination.NextCursor == nil {
 		t.Fatalf("instances = %+v", body)
+	}
+	cursor, err := page.Decode(*body.Pagination.NextCursor)
+	if err != nil || cursor.ID != firstID || !cursor.SortTime.Equal(createdAt) {
+		t.Fatalf("cursor = %+v, err = %v", cursor, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListByWorldDoesNotExposeInstancesFromHiddenWorld(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newTestRouter(db)
+	worldID := uuid.New()
+
+	mock.ExpectQuery(regexp.QuoteMeta(worldAccessTargetSQL)).
+		WithArgs(worldID).
+		WillReturnRows(sqlmock.NewRows([]string{"owner_actor_id", "visibility"}).AddRow(uuid.New(), "private"))
+
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/worlds/"+worldID.String()+"/instances", nil))
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -271,7 +300,7 @@ func TestCreateInstanceInPrivateWorldWithoutAccessReturnsNotFound(t *testing.T) 
 	worldID := uuid.New()
 	ownerID := uuid.New()
 
-	mock.ExpectQuery("SELECT owner_actor_id, visibility FROM worlds WHERE id").
+	mock.ExpectQuery(regexp.QuoteMeta(worldAccessTargetSQL)).
 		WithArgs(worldID).
 		WillReturnRows(sqlmock.NewRows([]string{"owner_actor_id", "visibility"}).AddRow(ownerID, "private"))
 
@@ -396,4 +425,8 @@ func joinInstanceRows() *sqlmock.Rows {
 
 func instanceRows() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{"id", "world_id", "host_actor_id", "instance_key", "name", "visibility", "launch_url", "capacity", "current_users", "status", "expires_at", "metadata"})
+}
+
+func listInstanceRows() *sqlmock.Rows {
+	return sqlmock.NewRows([]string{"id", "world_id", "host_actor_id", "instance_key", "name", "visibility", "launch_url", "capacity", "current_users", "status", "expires_at", "metadata", "created_at"})
 }

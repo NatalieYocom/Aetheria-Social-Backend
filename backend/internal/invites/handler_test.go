@@ -3,19 +3,57 @@ package invites
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"basisvr-social-service/internal/auth"
+	"basisvr-social-service/internal/common/page"
 	"basisvr-social-service/internal/realtime"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )
+
+func TestListInvitesReturnsCursorEnvelope(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newTestRouter(db, nil)
+	createdAt := time.Now().UTC().Truncate(time.Microsecond)
+	firstInviteID := uuid.New()
+	fromActorID := uuid.New()
+	toActorID := uuid.New()
+
+	mock.ExpectQuery("FROM invites i").
+		WithArgs(testPrincipal.ActorID, nil, uuid.Nil, 2).
+		WillReturnRows(inviteRows().
+			AddRow(firstInviteID, fromActorID, "from@example.social", "From", toActorID, "to@example.social", "To", nil, nil, nil, "", "direct", "pending", createdAt.Add(time.Hour), createdAt).
+			AddRow(uuid.New(), fromActorID, "from@example.social", "From", toActorID, "to@example.social", "To", nil, nil, nil, "", "direct", "pending", createdAt.Add(time.Hour), createdAt.Add(-time.Second)))
+
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/invites?limit=1", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	var response page.Response[InviteResponse]
+	if err := json.Unmarshal(res.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Data) != 1 || response.Pagination.NextCursor == nil {
+		t.Fatalf("response = %+v", response)
+	}
+	cursor, err := page.Decode(*response.Pagination.NextCursor)
+	if err != nil || cursor.ID != firstInviteID || !cursor.SortTime.Equal(createdAt) {
+		t.Fatalf("cursor = %+v, err = %v", cursor, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestCreateInviteCreatesDurableNotification(t *testing.T) {
 	db, mock := newMockDB(t)
@@ -31,7 +69,10 @@ func TestCreateInviteCreatesDurableNotification(t *testing.T) {
 	toEvents, unsubscribe := broker.Subscribe(context.Background(), toActorID)
 	defer unsubscribe()
 
-	mock.ExpectQuery("SELECT owner_actor_id, visibility FROM worlds WHERE id").
+	mock.ExpectQuery("(?s)SELECT a.id.*LEFT JOIN users u.*u.status = 'active'").
+		WithArgs(toActorID).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(toActorID))
+	mock.ExpectQuery(regexp.QuoteMeta(worldAccessTargetSQL)).
 		WithArgs(worldID).
 		WillReturnRows(sqlmock.NewRows([]string{"owner_actor_id", "visibility"}).AddRow(worldOwnerID, "public"))
 	mock.ExpectQuery("INSERT INTO invites").
@@ -83,7 +124,10 @@ func TestCreateInviteInPrivateWorldWithoutAccessReturnsNotFound(t *testing.T) {
 	worldID := uuid.New()
 	ownerID := uuid.New()
 
-	mock.ExpectQuery("SELECT owner_actor_id, visibility FROM worlds WHERE id").
+	mock.ExpectQuery("(?s)SELECT a.id.*LEFT JOIN users u.*u.status = 'active'").
+		WithArgs(toActorID).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(toActorID))
+	mock.ExpectQuery(regexp.QuoteMeta(worldAccessTargetSQL)).
 		WithArgs(worldID).
 		WillReturnRows(sqlmock.NewRows([]string{"owner_actor_id", "visibility"}).AddRow(ownerID, "private"))
 
@@ -93,6 +137,27 @@ func TestCreateInviteInPrivateWorldWithoutAccessReturnsNotFound(t *testing.T) {
 
 	router.ServeHTTP(res, req)
 
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCreateInviteToSuspendedLocalActorReturnsNotFound(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newTestRouter(db, nil)
+	toActorID := uuid.New()
+
+	mock.ExpectQuery("(?s)SELECT a.id.*LEFT JOIN users u.*u.status = 'active'").
+		WithArgs(toActorID).
+		WillReturnError(sql.ErrNoRows)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/invites", strings.NewReader(`{"toActorId":"`+toActorID.String()+`","message":"hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
 	if res.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
 	}

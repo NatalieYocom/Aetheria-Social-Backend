@@ -77,3 +77,34 @@ func TestBuildPersonActorDocumentKeepsActivityPubShape(t *testing.T) {
 		t.Fatalf("publicKey.id = %v", publicKey["id"])
 	}
 }
+
+func TestBuildLocalGroupActorMetadata(t *testing.T) {
+	meta := activitypub.BuildLocalGroupActorMetadata(activitypub.LocalActorInput{
+		PublicURL: "https://basis.social/", Username: "world-creators", DisplayName: "World Creators",
+	})
+	if meta.Type != "Group" || meta.ActorURI != "https://basis.social/groups/world-creators" {
+		t.Fatalf("meta = %+v", meta)
+	}
+	if meta.InboxURL != meta.ActorURI+"/inbox" || meta.FollowersURL != meta.ActorURI+"/followers" {
+		t.Fatalf("group collection URLs = %+v", meta)
+	}
+	doc := activitypub.BuildGroupActorDocument(meta)
+	if doc["type"] != "Group" || doc["id"] != meta.ActorURI {
+		t.Fatalf("document = %+v", doc)
+	}
+}
+
+func TestBuildServiceActorDocument(t *testing.T) {
+	doc := activitypub.BuildServiceActorDocument(activitypub.ActorMetadata{
+		ActorURI: "https://basis.social/actor", PreferredUsername: "instance",
+		DisplayName: "BasisVR Social", PublicKeyPEM: "public-key",
+		InboxURL: "https://basis.social/actor/inbox", OutboxURL: "https://basis.social/actor/outbox",
+	})
+	if doc["type"] != "Service" || doc["id"] != "https://basis.social/actor" {
+		t.Fatalf("document = %+v", doc)
+	}
+	publicKey := doc["publicKey"].(map[string]any)
+	if publicKey["owner"] != doc["id"] {
+		t.Fatalf("publicKey = %+v", publicKey)
+	}
+}

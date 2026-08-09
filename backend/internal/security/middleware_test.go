@@ -46,6 +46,34 @@ func TestBodyLimitRejectsOversizedContentLength(t *testing.T) {
 	}
 }
 
+func TestCORSAllowsConfiguredOriginAndPreflight(t *testing.T) {
+	handler := CORS([]string{"https://beeba.example"})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodOptions, "/api/v1/assets/search", nil)
+	req.Header.Set("Origin", "https://beeba.example")
+	req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusNoContent || res.Header().Get("Access-Control-Allow-Origin") != "https://beeba.example" {
+		t.Fatalf("status = %d, headers = %#v", res.Code, res.Header())
+	}
+}
+
+func TestCORSRejectsUnconfiguredPreflightOrigin(t *testing.T) {
+	handler := CORS([]string{"https://beeba.example"})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatal("rejected preflight reached handler")
+	}))
+	req := httptest.NewRequest(http.MethodOptions, "/api/v1/assets/search", nil)
+	req.Header.Set("Origin", "https://attacker.example")
+	req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusForbidden {
+		t.Fatalf("status = %d", res.Code)
+	}
+}
+
 func TestRateLimitRejectsAfterLimitAndResetsAfterWindow(t *testing.T) {
 	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	limiter := NewFixedWindowLimiter(FixedWindowConfig{

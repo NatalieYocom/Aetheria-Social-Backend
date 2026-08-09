@@ -164,14 +164,26 @@ WHERE world_id = $1 AND asset_ref_id = $2`, worldID, assetID)
 
 func (r repository) worldOwner(ctx context.Context, worldID uuid.UUID) (uuid.UUID, error) {
 	var ownerID uuid.UUID
-	err := r.db.QueryRowContext(ctx, `SELECT owner_actor_id FROM worlds WHERE id = $1`, worldID).Scan(&ownerID)
+	err := r.db.QueryRowContext(ctx, `
+SELECT owner_actor_id
+FROM worlds w
+JOIN actors owner_actor ON owner_actor.id = w.owner_actor_id
+LEFT JOIN users owner_user ON owner_user.id = owner_actor.local_user_id
+WHERE w.id = $1
+  AND (owner_actor.local_user_id IS NULL OR owner_user.status = 'active')`, worldID).Scan(&ownerID)
 	return ownerID, err
 }
 
 func (r repository) worldAccess(ctx context.Context, worldID uuid.UUID) (uuid.UUID, string, error) {
 	var ownerID uuid.UUID
 	var visibility string
-	err := r.db.QueryRowContext(ctx, `SELECT owner_actor_id, visibility FROM worlds WHERE id = $1`, worldID).Scan(&ownerID, &visibility)
+	err := r.db.QueryRowContext(ctx, `
+SELECT owner_actor_id, visibility
+FROM worlds w
+JOIN actors owner_actor ON owner_actor.id = w.owner_actor_id
+LEFT JOIN users owner_user ON owner_user.id = owner_actor.local_user_id
+WHERE w.id = $1
+  AND (owner_actor.local_user_id IS NULL OR owner_user.status = 'active')`, worldID).Scan(&ownerID, &visibility)
 	return ownerID, visibility, err
 }
 

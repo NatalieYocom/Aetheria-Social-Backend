@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"basisvr-social-service/internal/common/page"
+
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/google/uuid"
 )
@@ -207,4 +209,76 @@ func TestCreateWorldServerCredentialReturnsSecretButStoresHash(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestListWorldServerCredentialsReturnsCursorPage(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newTestRouter(db)
+	createdAt := time.Now().UTC().Truncate(time.Microsecond)
+	firstID := uuid.New()
+
+	mock.ExpectQuery("SELECT role FROM users").
+		WithArgs(testPrincipal.UserID).
+		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("admin"))
+	mock.ExpectQuery(regexp.QuoteMeta(listWorldServerCredentialsSQL)).
+		WithArgs(nil, uuid.Nil, 2).
+		WillReturnRows(worldServerCredentialRows().
+			AddRow(firstID, "first", "bvr_ws_first", nil, "active", []byte(`{}`), nil, nil, createdAt).
+			AddRow(uuid.New(), "second", "bvr_ws_second", nil, "active", []byte(`{}`), nil, nil, createdAt.Add(-time.Second)))
+
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/admin/world-server-credentials?limit=1", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	var body page.Response[WorldServerCredentialResponse]
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body.Data) != 1 || body.Data[0].ID != firstID || body.Pagination.NextCursor == nil {
+		t.Fatalf("body = %+v", body)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListInstanceJoinAuditReturnsCursorPage(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newTestRouter(db)
+	createdAt := time.Now().UTC().Truncate(time.Microsecond)
+	firstID := uuid.New()
+
+	mock.ExpectQuery("SELECT role FROM users").
+		WithArgs(testPrincipal.UserID).
+		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("admin"))
+	mock.ExpectQuery(regexp.QuoteMeta(listInstanceJoinAuditSQL)).
+		WithArgs(nil, uuid.Nil, 2).
+		WillReturnRows(instanceJoinAuditRows().
+			AddRow(firstID, nil, nil, nil, nil, "accepted", "127.0.0.1", []byte(`{}`), createdAt).
+			AddRow(uuid.New(), nil, nil, nil, nil, "rejected", "127.0.0.2", []byte(`{}`), createdAt.Add(-time.Second)))
+
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/admin/instance-join-audit?limit=1", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	var body page.Response[InstanceJoinAuditResponse]
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body.Data) != 1 || body.Data[0].ID != firstID || body.Pagination.NextCursor == nil {
+		t.Fatalf("body = %+v", body)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func worldServerCredentialRows() *sqlmock.Rows {
+	return sqlmock.NewRows([]string{"id", "name", "token_prefix", "allowed_world_id", "status", "metadata", "last_used_at", "revoked_at", "created_at"})
+}
+
+func instanceJoinAuditRows() *sqlmock.Rows {
+	return sqlmock.NewRows([]string{"id", "ticket_id", "credential_id", "actor_id", "instance_id", "outcome", "remote_ip", "details", "created_at"})
 }
