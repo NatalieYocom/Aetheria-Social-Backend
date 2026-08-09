@@ -251,13 +251,18 @@ func TestBrokerIgnoresOwnBusEcho(t *testing.T) {
 }
 
 type memoryBus struct {
-	subscribe chan chan []byte
+	subscribe chan memorySubscription
 	publish   chan []byte
+}
+
+type memorySubscription struct {
+	messages chan []byte
+	ready    chan struct{}
 }
 
 func newMemoryBus() *memoryBus {
 	bus := &memoryBus{
-		subscribe: make(chan chan []byte, 8),
+		subscribe: make(chan memorySubscription, 8),
 		publish:   make(chan []byte, 8),
 	}
 	go bus.run()
@@ -275,8 +280,17 @@ func (b *memoryBus) Publish(ctx context.Context, topic string, data []byte) erro
 
 func (b *memoryBus) Subscribe(ctx context.Context, topic string) (<-chan []byte, error) {
 	ch := make(chan []byte, 8)
+	subscription := memorySubscription{
+		messages: ch,
+		ready:    make(chan struct{}),
+	}
 	select {
-	case b.subscribe <- ch:
+	case b.subscribe <- subscription:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case <-subscription.ready:
 		return ch, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -291,8 +305,9 @@ func (b *memoryBus) run() {
 	subscribers := []chan []byte{}
 	for {
 		select {
-		case ch := <-b.subscribe:
-			subscribers = append(subscribers, ch)
+		case subscription := <-b.subscribe:
+			subscribers = append(subscribers, subscription.messages)
+			close(subscription.ready)
 		case data := <-b.publish:
 			for _, ch := range subscribers {
 				select {
