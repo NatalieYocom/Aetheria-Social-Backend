@@ -31,7 +31,7 @@ docker compose --env-file .env -f docker-compose.production.yml ps -a
 
 DNS домена должен указывать на сервер, порты `80` и `443` должны быть открыты.
 Caddy получит TLS-сертификат автоматически. Миграции выполняются перед запуском
-API; перед обновлением образа обязательно сделайте резервную копию PostgreSQL.
+API; перед обновлением образа обязательно сделать резервную копию PostgreSQL.
 
 Для запуска OpenTelemetry Collector добавить `--profile telemetry` к команде
 `up -d`.
