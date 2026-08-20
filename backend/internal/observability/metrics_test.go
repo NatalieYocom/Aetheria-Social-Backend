@@ -1,7 +1,9 @@
 package observability
 
 import (
+	"bufio"
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +11,22 @@ import (
 
 	"github.com/go-chi/chi/v5"
 )
+
+type hijackableResponseWriter struct {
+	http.ResponseWriter
+}
+
+func (w hijackableResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return nil, nil, nil
+}
+
+func TestStatusRecorderUnwrapsForResponseController(t *testing.T) {
+	res := httptest.NewRecorder()
+	recorder := &statusRecorder{ResponseWriter: hijackableResponseWriter{ResponseWriter: res}}
+	if _, _, err := http.NewResponseController(recorder).Hijack(); err != nil {
+		t.Fatalf("hijack through status recorder: %v", err)
+	}
+}
 
 func TestMetricsMiddlewareCountsRequestsByMethodRouteAndStatus(t *testing.T) {
 	metrics := NewMetrics()
