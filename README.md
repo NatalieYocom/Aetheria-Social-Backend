@@ -1,4 +1,4 @@
-# BasisVR Social Service
+# Aetheria Social Service
 
 A comprehensive social service backend for BasisVR, built with Go. This service provides real-time communication, user presence tracking, activity streaming, and federation capabilities for the BasisVR ecosystem.
 
