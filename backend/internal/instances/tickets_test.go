@@ -15,6 +15,8 @@ import (
 	"github.com/google/uuid"
 )
 
+const testClientDID = "did:key:z6MkeTGwHmLmuCmgg4ABYhzWVh6ZX7hTwWt8gguAretUfc9c"
+
 func TestOpaqueTokenUsesPrefixAndStableHash(t *testing.T) {
 	token, err := newOpaqueToken(joinTicketPrefix)
 	if err != nil {
@@ -37,9 +39,12 @@ func TestIssueJoinTicketReturnsSecretOnce(t *testing.T) {
 	ticketID := uuid.New()
 
 	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(lockActorSQL)).WithArgs(testPrincipal.ActorID).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(testPrincipal.ActorID))
 	mock.ExpectQuery(regexp.QuoteMeta(joinInstanceSelectSQL)).
 		WithArgs(instanceID).
 		WillReturnRows(joinInstanceRows().AddRow(instanceID, worldID, hostID, "public", 16, 0, "active", nil))
+	mock.ExpectQuery("SELECT w.owner_actor_id,w.visibility").WillReturnRows(sqlmock.NewRows([]string{"owner", "visibility"}).AddRow(uuid.New(), "public"))
+	mock.ExpectQuery("SELECT EXISTS.*type = 'block'").WillReturnRows(sqlmock.NewRows([]string{"blocked"}).AddRow(false))
 	mock.ExpectQuery(regexp.QuoteMeta(joinedMemberExistsSQL)).
 		WithArgs(instanceID, testPrincipal.ActorID).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
@@ -47,14 +52,14 @@ func TestIssueJoinTicketReturnsSecretOnce(t *testing.T) {
 		WithArgs(testPrincipal.ActorID, instanceID).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery(regexp.QuoteMeta(insertJoinTicketSQL)).
-		WithArgs(sqlmock.AnyArg(), testPrincipal.ActorID, instanceID, "friends", true, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), testPrincipal.ActorID, instanceID, "friends", true, sqlmock.AnyArg(), sqlmock.AnyArg(), testClientDID).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(ticketID))
 	mock.ExpectCommit()
 	mock.ExpectQuery(regexp.QuoteMeta(loadInstanceSQL)).
 		WithArgs(instanceID).
 		WillReturnRows(instanceRows().AddRow(instanceID, worldID, hostID, "instance-key", "World", "public", "basis://join", 16, 0, "active", nil, []byte(`{}`)))
 
-	req := httptest.NewRequest(http.MethodPost, "/api/instances/"+instanceID.String()+"/join-tickets", strings.NewReader(`{"presenceVisibility":"friends","showExactInstance":true}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/instances/"+instanceID.String()+"/join-tickets", strings.NewReader(`{"presenceVisibility":"friends","showExactInstance":true,"clientDid":"`+testClientDID+`"}`))
 	req.Header.Set("Content-Type", "application/json")
 	res := httptest.NewRecorder()
 	router.ServeHTTP(res, req)
@@ -110,21 +115,25 @@ func TestConsumeJoinTicketCreatesMembershipPresenceAndConsumesTicket(t *testing.
 		WithArgs(hashOpaqueToken(serviceToken)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "allowed_world_id"}).AddRow(credentialID, "world-server", worldID))
 	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT actor_id FROM instance_join_tickets").WithArgs(hashOpaqueToken(token)).WillReturnRows(sqlmock.NewRows([]string{"actor_id"}).AddRow(actorID))
+	mock.ExpectQuery(regexp.QuoteMeta(lockActorSQL)).
+		WithArgs(actorID).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(actorID))
 	mock.ExpectQuery(regexp.QuoteMeta(loadJoinTicketForConsumeSQL)).
 		WithArgs(hashOpaqueToken(token)).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "actor_id", "instance_id", "presence_visibility", "show_exact_instance",
-			"metadata", "expires_at", "consumed_at", "acct", "status",
-		}).AddRow(ticketID, actorID, instanceID, "friends", true, []byte(`{"client":"test"}`), expiresAt, nil, "alice@example.test", "active"))
-	mock.ExpectQuery(regexp.QuoteMeta(lockActorSQL)).
-		WithArgs(actorID).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(actorID))
+			"metadata", "expires_at", "consumed_at", "acct", "status", "client_did",
+		}).AddRow(ticketID, actorID, instanceID, "friends", true, []byte(`{"client":"test"}`), expiresAt, nil, "alice@example.test", "active", testClientDID))
+
 	mock.ExpectQuery(regexp.QuoteMeta(joinInstanceSelectSQL)).
 		WithArgs(instanceID).
-		WillReturnRows(joinInstanceRows().AddRow(instanceID, worldID, hostID, "public", 16, 0, "active", nil))
+		WillReturnRows(joinInstanceRows().AddRow(instanceID, worldID, hostID, "public", 16, 0, "active", time.Now().Add(time.Minute)))
 	mock.ExpectExec(regexp.QuoteMeta(claimRuntimeInstanceSQL)).
 		WithArgs(instanceID, credentialID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT w.owner_actor_id,w.visibility").WillReturnRows(sqlmock.NewRows([]string{"owner", "visibility"}).AddRow(uuid.New(), "public"))
+	mock.ExpectQuery("SELECT EXISTS.*type = 'block'").WillReturnRows(sqlmock.NewRows([]string{"blocked"}).AddRow(false))
 	mock.ExpectQuery(regexp.QuoteMeta(joinedMemberExistsSQL)).
 		WithArgs(instanceID, actorID).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
@@ -154,7 +163,7 @@ func TestConsumeJoinTicketCreatesMembershipPresenceAndConsumesTicket(t *testing.
 		WithArgs(instanceID).
 		WillReturnRows(instanceRows().AddRow(instanceID, worldID, hostID, "instance-key", "World", "public", "basis://join", 16, 1, "active", nil, []byte(`{}`)))
 
-	req := httptest.NewRequest(http.MethodPost, "/api/service/instance-join-tickets/consume", strings.NewReader(`{"ticket":"`+token+`"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/service/instance-join-tickets/consume", strings.NewReader(`{"ticket":"`+token+`","instanceId":"`+instanceID.String()+`","clientDid":"`+testClientDID+`"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Basis-Service-Token", serviceToken)
 	res := httptest.NewRecorder()
@@ -281,4 +290,15 @@ func worldServerCredentialRows() *sqlmock.Rows {
 
 func instanceJoinAuditRows() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{"id", "ticket_id", "credential_id", "actor_id", "instance_id", "outcome", "remote_ip", "details", "created_at"})
+}
+
+func TestJoinTicketDIDValidation(t *testing.T) {
+	if !validClientDID(testClientDID) {
+		t.Fatal("canonical Ed25519 DID rejected")
+	}
+	for _, invalid := range []string{"", "did:key:z", testClientDID + "?key=1", " " + testClientDID, strings.Replace(testClientDID, "z6Mk", "z7Mk", 1), strings.Replace(testClientDID, "z6Mk", "z0Mk", 1)} {
+		if validClientDID(invalid) {
+			t.Fatalf("accepted invalid client DID: %q", invalid)
+		}
+	}
 }

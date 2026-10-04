@@ -9,12 +9,14 @@ import (
 	"strings"
 
 	"basisvr-social-service/internal/activitypub"
+	"basisvr-social-service/internal/actorcrypto"
 	"basisvr-social-service/internal/common/httpx"
 	"basisvr-social-service/internal/common/validate"
 	"basisvr-social-service/internal/config"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type Handler struct {
@@ -32,6 +34,10 @@ func RegisterRoutes(r chi.Router, h *Handler, authMiddleware func(http.Handler) 
 		r.Post("/register", h.Register)
 		r.Post("/login", h.Login)
 		r.With(authMiddleware).Post("/logout", h.Logout)
+		r.With(authMiddleware).Post("/logout-all", h.Logout)
+		r.With(authMiddleware).Post("/logout-current", h.LogoutCurrent)
+		r.With(authMiddleware).Get("/sessions", h.ListSessions)
+		r.With(authMiddleware).Delete("/sessions/{id}", h.RevokeSession)
 		r.Post("/refresh", h.Refresh)
 	})
 	r.With(authMiddleware).Get("/api/me", h.Me)
@@ -118,8 +124,8 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_username", "username must be 3-32 characters and contain only letters, numbers, dot, dash or underscore")
 		return
 	}
-	if len(req.Password) < 8 {
-		httpx.WriteError(w, http.StatusBadRequest, "weak_password", "password must be at least 8 characters")
+	if len(req.Password) < 8 || len(req.Password) > 72 {
+		httpx.WriteError(w, http.StatusBadRequest, "weak_password", "password must contain 8-72 bytes")
 		return
 	}
 
@@ -144,12 +150,20 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pair, err := h.tokens.Issue(TokenSubject{
+	pair, err := NewSessionStore(h.db, h.tokens).Start(r.Context(), TokenSubject{
 		UserID:   user.ID.String(),
 		ActorID:  user.ActorID.String(),
 		Username: user.Username,
 		Version:  user.AuthVersion,
 	})
+	if errors.Is(err, ErrSessionInvalid) {
+		httpx.WriteError(w, 401, "token_revoked", "account credentials changed; sign in again")
+		return
+	}
+	if errors.Is(err, ErrSessionLimit) {
+		httpx.WriteError(w, 409, "session_limit", "revoke an existing device session before signing in")
+		return
+	}
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "token_failed", "could not issue token")
 		return
@@ -172,7 +186,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	if login == "" {
 		login = strings.ToLower(strings.TrimSpace(req.Username))
 	}
-	if login == "" || req.Password == "" {
+	if login == "" || req.Password == "" || len(req.Password) > 72 || len(login) > 320 {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_credentials", "login and password are required")
 		return
 	}
@@ -191,12 +205,20 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pair, err := h.tokens.Issue(TokenSubject{
+	pair, err := NewSessionStore(h.db, h.tokens).Start(r.Context(), TokenSubject{
 		UserID:   user.ID.String(),
 		ActorID:  user.ActorID.String(),
 		Username: user.Username,
 		Version:  user.AuthVersion,
 	})
+	if errors.Is(err, ErrSessionInvalid) {
+		httpx.WriteError(w, 401, "token_revoked", "account credentials changed; sign in again")
+		return
+	}
+	if errors.Is(err, ErrSessionLimit) {
+		httpx.WriteError(w, 409, "session_limit", "revoke an existing device session before signing in")
+		return
+	}
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "token_failed", "could not issue token")
 		return
@@ -226,6 +248,10 @@ func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(req.RefreshToken) > 8192 {
+		httpx.WriteError(w, 401, "unauthorized", "invalid refresh token")
+		return
+	}
 	claims, err := h.tokens.VerifyRefresh(req.RefreshToken)
 	if err != nil {
 		httpx.WriteError(w, http.StatusUnauthorized, "unauthorized", "invalid refresh token")
@@ -239,6 +265,10 @@ func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := h.loadMe(r.Context(), userID)
 	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			httpx.WriteError(w, 503, "auth_status_unavailable", "could not verify account status")
+			return
+		}
 		httpx.WriteError(w, http.StatusUnauthorized, "unauthorized", "user no longer exists")
 		return
 	}
@@ -251,12 +281,32 @@ func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pair, err := h.tokens.Issue(TokenSubject{
+	sessionID, err := uuid.Parse(claims.SessionID)
+	if err != nil {
+		httpx.WriteError(w, 401, "unauthorized", "invalid refresh token")
+		return
+	}
+	principal := Principal{UserID: user.ID, ActorID: user.ActorID, SessionID: sessionID, AuthVersion: user.AuthVersion, ExpiresAt: claims.ExpiresAt.Time}
+	valid, err := LinkedIdentityValidator(h.db, h.cfg.BeeBa)(r.Context(), principal)
+	if err != nil {
+		httpx.WriteError(w, 503, "auth_status_unavailable", "could not verify identity status")
+		return
+	}
+	if !valid {
+		httpx.WriteError(w, 401, "token_revoked", "session identity has been revoked")
+		return
+	}
+
+	pair, err := NewSessionStore(h.db, h.tokens).Rotate(r.Context(), req.RefreshToken, claims, TokenSubject{
 		UserID:   user.ID.String(),
 		ActorID:  user.ActorID.String(),
 		Username: user.Username,
 		Version:  user.AuthVersion,
 	})
+	if errors.Is(err, ErrSessionInvalid) {
+		httpx.WriteError(w, 401, "token_revoked", "refresh token has been revoked")
+		return
+	}
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "token_failed", "could not issue token")
 		return
@@ -343,7 +393,7 @@ func (h *Handler) DeleteAccount(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
-	if strings.TrimSpace(req.Password) == "" {
+	if strings.TrimSpace(req.Password) == "" || len(req.Password) > 72 {
 		httpx.WriteError(w, http.StatusBadRequest, "password_required", "password is required")
 		return
 	}
@@ -366,6 +416,15 @@ FOR UPDATE OF user_account, actor`, principal.UserID).Scan(&passwordHash, &domai
 			return
 		}
 		httpx.WriteError(w, http.StatusInternalServerError, "account_delete_failed", err.Error())
+		return
+	}
+	var managed bool
+	if err := tx.QueryRowContext(r.Context(), `SELECT EXISTS(SELECT 1 FROM beeba_identity_links WHERE user_id=$1)`, principal.UserID).Scan(&managed); err != nil {
+		httpx.WriteError(w, 503, "auth_status_unavailable", "could not verify identity status")
+		return
+	}
+	if managed {
+		httpx.WriteError(w, 409, "managed_identity", "linked account deletion requires BeeBa identity confirmation")
 		return
 	}
 	if !VerifyPassword(passwordHash, req.Password) {
@@ -438,22 +497,30 @@ func (h *Handler) createLocalUser(ctx context.Context, email, username, displayN
 	if err != nil {
 		return meResponse{}, err
 	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
+	defer tx.Rollback()
+	id, err := h.createLocalUserTx(ctx, tx, email, username, displayName, passwordHash)
+	if err != nil {
+		return meResponse{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return meResponse{}, err
+	}
+	return h.loadMe(ctx, id)
+}
 
+func (h *Handler) createLocalUserTx(ctx context.Context, tx *sql.Tx, email, username, displayName, passwordHash string) (uuid.UUID, error) {
 	var userID uuid.UUID
 	if err := tx.QueryRowContext(ctx, `
 INSERT INTO users (email, password_hash, username)
 VALUES ($1, $2, $3)
 RETURNING id`, email, passwordHash, username).Scan(&userID); err != nil {
-		return meResponse{}, err
+		return uuid.Nil, err
 	}
 
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO profiles (user_id, display_name)
 VALUES ($1, $2)`, userID, displayName); err != nil {
-		return meResponse{}, err
+		return uuid.Nil, err
 	}
 
 	meta := activitypub.BuildLocalActorMetadata(activitypub.LocalActorInput{
@@ -463,13 +530,16 @@ VALUES ($1, $2)`, userID, displayName); err != nil {
 	})
 	keyPair, err := activitypub.GenerateActorKeyPair()
 	if err != nil {
-		return meResponse{}, err
+		return uuid.Nil, err
 	}
 	meta.PublicKeyPEM = keyPair.PublicKeyPEM
-	meta.PrivateKeyEncrypted = keyPair.PrivateKeyPEM
+	meta.PrivateKeyEncrypted, err = actorcrypto.Encrypt(h.cfg.ActivityPub.ActorKeyEncryptionKey, meta.ActorURI, keyPair.PrivateKeyPEM)
+	if err != nil {
+		return uuid.Nil, err
+	}
 	rawJSON, err := json.Marshal(activitypub.BuildPersonActorDocument(meta))
 	if err != nil {
-		return meResponse{}, err
+		return uuid.Nil, err
 	}
 
 	var actorID uuid.UUID
@@ -484,14 +554,10 @@ RETURNING id`,
 		meta.InboxURL, meta.OutboxURL, meta.FollowersURL, meta.FollowingURL, meta.SharedInboxURL,
 		meta.PublicKeyPEM, meta.PrivateKeyEncrypted, rawJSON,
 	).Scan(&actorID); err != nil {
-		return meResponse{}, err
+		return uuid.Nil, err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return meResponse{}, err
-	}
-
-	return h.loadMe(ctx, userID)
+	return userID, nil
 }
 
 func (h *Handler) findLoginUser(ctx context.Context, login string) (meResponse, string, error) {
@@ -500,7 +566,8 @@ func (h *Handler) findLoginUser(ctx context.Context, login string) (meResponse, 
 	err := h.db.QueryRowContext(ctx, `
 SELECT u.id, u.password_hash
 FROM users u
-WHERE (u.email = $1 OR u.username = $1) AND u.status = 'active'`, login).Scan(&userID, &passwordHash)
+WHERE (u.email = $1 OR u.username = $1) AND u.status = 'active'
+ AND NOT EXISTS (SELECT 1 FROM beeba_identity_links l WHERE l.user_id=u.id)`, login).Scan(&userID, &passwordHash)
 	if err != nil {
 		return meResponse{}, "", err
 	}
@@ -530,6 +597,9 @@ WHERE u.id = $1`, userID).Scan(
 	}
 	res.Profile.Links = decodeArray(linksRaw)
 	res.Profile.PrivacySettings = decodeObject(privacyRaw)
+	if err := h.applyBeeBaProfile(ctx, &res); err != nil {
+		return meResponse{}, err
+	}
 	return res, nil
 }
 
@@ -550,5 +620,6 @@ func decodeObject(data []byte) map[string]any {
 }
 
 func isUniqueViolation(err error) bool {
-	return strings.Contains(err.Error(), "duplicate key") || strings.Contains(err.Error(), "SQLSTATE 23505")
+	var pgError *pgconn.PgError
+	return errors.As(err, &pgError) && pgError.Code == "23505"
 }

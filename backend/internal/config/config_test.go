@@ -201,7 +201,7 @@ func TestValidateAcceptsProductionConfiguration(t *testing.T) {
 		Auth:        config.AuthConfig{JWTSecret: strings.Repeat("a", 48)},
 		Redis:       config.RedisConfig{URL: "rediss://redis.example:6380/0"},
 		Realtime:    config.RealtimeConfig{ReplayEnabled: true},
-		ActivityPub: config.ActivityPubConfig{Enabled: true, Domain: "social.example", AuthorizedFetch: "protected"},
+		ActivityPub: config.ActivityPubConfig{ActorKeyEncryptionKey: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", Enabled: true, Domain: "social.example", AuthorizedFetch: "protected"},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
@@ -214,7 +214,7 @@ func TestValidateRejectsUnknownAuthorizedFetchModeInProduction(t *testing.T) {
 		Server:      config.ServerConfig{PublicURL: "https://social.example"},
 		Database:    config.DatabaseConfig{URL: "postgres://basis:secret@db/basis?sslmode=require"},
 		Auth:        config.AuthConfig{JWTSecret: strings.Repeat("a", 48)},
-		ActivityPub: config.ActivityPubConfig{Enabled: true, Domain: "social.example", AuthorizedFetch: "sometimes"},
+		ActivityPub: config.ActivityPubConfig{ActorKeyEncryptionKey: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", Enabled: true, Domain: "social.example", AuthorizedFetch: "sometimes"},
 	}
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "ACTIVITYPUB_AUTHORIZED_FETCH") {

@@ -36,6 +36,9 @@ func TestJoinPublicInstanceCreatesMemberUpdatesCounterAndPresence(t *testing.T) 
 	mock.ExpectQuery(regexp.QuoteMeta(joinInstanceSelectSQL)).
 		WithArgs(instanceID).
 		WillReturnRows(joinInstanceRows().AddRow(instanceID, worldID, hostID, "public", 8, 0, "active", nil))
+	mock.ExpectQuery("SELECT world_server_credential_id IS NOT NULL").WillReturnRows(sqlmock.NewRows([]string{"managed"}).AddRow(false))
+	mock.ExpectQuery("SELECT w.owner_actor_id,w.visibility").WillReturnRows(sqlmock.NewRows([]string{"owner", "visibility"}).AddRow(uuid.New(), "public"))
+	mock.ExpectQuery("SELECT EXISTS.*type = 'block'").WillReturnRows(sqlmock.NewRows([]string{"blocked"}).AddRow(false))
 	mock.ExpectQuery(regexp.QuoteMeta(joinedMemberExistsSQL)).
 		WithArgs(instanceID, actorID).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
@@ -91,6 +94,9 @@ func TestJoinFullInstanceRejectsNewParticipant(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(joinInstanceSelectSQL)).
 		WithArgs(instanceID).
 		WillReturnRows(joinInstanceRows().AddRow(instanceID, worldID, hostID, "public", 1, 1, "active", nil))
+	mock.ExpectQuery("SELECT world_server_credential_id IS NOT NULL").WillReturnRows(sqlmock.NewRows([]string{"managed"}).AddRow(false))
+	mock.ExpectQuery("SELECT w.owner_actor_id,w.visibility").WillReturnRows(sqlmock.NewRows([]string{"owner", "visibility"}).AddRow(uuid.New(), "public"))
+	mock.ExpectQuery("SELECT EXISTS.*type = 'block'").WillReturnRows(sqlmock.NewRows([]string{"blocked"}).AddRow(false))
 	mock.ExpectQuery(regexp.QuoteMeta(joinedMemberExistsSQL)).
 		WithArgs(instanceID, actorID).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
@@ -153,6 +159,7 @@ func TestHeartbeatExtendsJoinedMemberAndPresence(t *testing.T) {
 		WithArgs(instanceID).
 		WillReturnRows(sqlmock.NewRows([]string{"world_id", "status", "expires_at"}).
 			AddRow(worldID, "active", nil))
+	mock.ExpectQuery("SELECT world_server_credential_id IS NOT NULL").WillReturnRows(sqlmock.NewRows([]string{"managed"}).AddRow(false))
 	mock.ExpectExec("UPDATE instance_members").
 		WithArgs(instanceID, actorID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -190,6 +197,7 @@ func TestHeartbeatRejectsActorThatHasNotJoined(t *testing.T) {
 		WithArgs(instanceID).
 		WillReturnRows(sqlmock.NewRows([]string{"world_id", "status", "expires_at"}).
 			AddRow(worldID, "active", nil))
+	mock.ExpectQuery("SELECT world_server_credential_id IS NOT NULL").WillReturnRows(sqlmock.NewRows([]string{"managed"}).AddRow(false))
 	mock.ExpectExec("UPDATE instance_members").
 		WithArgs(instanceID, actorID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 0))

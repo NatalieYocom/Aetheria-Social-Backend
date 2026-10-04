@@ -89,7 +89,7 @@ LEFT JOIN users owner_user ON owner_user.id = owner_actor.local_user_id
 WHERE e.id = $1
   AND (owner_actor.local_user_id IS NULL OR owner_user.status = 'active')`
 const instanceInviteTargetSQL = `
-SELECT host_actor_id, visibility, status, expires_at
+SELECT i.host_actor_id, i.visibility, i.status, i.expires_at
 FROM instances i
 JOIN actors host_actor ON host_actor.id = i.host_actor_id
 LEFT JOIN users host_user ON host_user.id = host_actor.local_user_id
@@ -121,6 +121,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_target", "cannot invite yourself")
 		return
 	}
+
 	if req.WorldID == nil && req.InstanceID == nil && req.EventID == nil {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_target", "worldId, instanceId or eventId is required")
 		return
@@ -146,8 +147,41 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		expiresAt = *req.ExpiresAt
 	}
 
+	if len(req.Message) > 2000 {
+		httpx.WriteError(w, 400, "invalid_message", "message must be 2000 bytes or fewer")
+		return
+	}
+	if req.Visibility != "direct" {
+		httpx.WriteError(w, 400, "invalid_visibility", "invite visibility must be direct")
+		return
+	}
+	now := time.Now()
+	if !expiresAt.After(now) || expiresAt.After(now.Add(7*24*time.Hour)) {
+		httpx.WriteError(w, 400, "invalid_expiration", "invite must expire within 7 days")
+		return
+	}
+	tx, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		httpx.WriteError(w, 500, "invite_failed", err.Error())
+		return
+	}
+	defer tx.Rollback()
+	if err = privacy.LockPair(r.Context(), tx, principal.ActorID, toActorID); err != nil {
+		httpx.WriteError(w, 500, "invite_failed", err.Error())
+		return
+	}
+	blocked, err := privacy.HasBlock(r.Context(), tx, principal.ActorID, toActorID)
+	if err != nil {
+		httpx.WriteError(w, 500, "invite_failed", err.Error())
+		return
+	}
+	if blocked {
+		httpx.WriteError(w, 403, "relationship_unavailable", "interaction is unavailable")
+		return
+	}
+
 	var id uuid.UUID
-	if err := h.db.QueryRowContext(r.Context(), `
+	if err := tx.QueryRowContext(r.Context(), `
 INSERT INTO invites (from_actor_id, to_actor_id, instance_id, world_id, event_id, message, visibility, expires_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING id`,
@@ -164,12 +198,12 @@ RETURNING id`,
 		return
 	}
 
-	invite, err := h.loadByID(r.Context(), id)
+	invite, err := scanInvite(tx.QueryRowContext(r.Context(), inviteQuery()+" WHERE i.id = $1", id))
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "load_invite_failed", err.Error())
 		return
 	}
-	notification, err := notifications.CreateAndPublish(r.Context(), h.db, h.events, notifications.CreateInput{
+	notification, err := notifications.Insert(r.Context(), tx, notifications.CreateInput{
 		ActorID: invite.To.ActorID,
 		Type:    "invite.created",
 		Payload: inviteEventPayload(invite),
@@ -178,7 +212,11 @@ RETURNING id`,
 		httpx.WriteError(w, http.StatusInternalServerError, "notification_failed", err.Error())
 		return
 	}
-	_ = notification
+	if err = tx.Commit(); err != nil {
+		httpx.WriteError(w, 500, "invite_failed", err.Error())
+		return
+	}
+	notifications.PublishCreated(h.events, notification)
 	realtime.PublishActorEvent(h.events, []uuid.UUID{invite.From.ActorID, invite.To.ActorID}, "invite.created", principal.ActorID, inviteEventPayload(invite))
 	httpx.WriteJSON(w, http.StatusCreated, invite)
 }
@@ -194,6 +232,16 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_pagination", err.Error())
 		return
 	}
+	direction := r.URL.Query().Get("direction")
+	if direction != "" && direction != "incoming" && direction != "outgoing" {
+		httpx.WriteError(w, 400, "invalid_direction", "direction must be incoming or outgoing")
+		return
+	}
+	state := r.URL.Query().Get("state")
+	if state != "" && state != "pending" && state != "accepted" && state != "declined" {
+		httpx.WriteError(w, 400, "invalid_state", "state must be pending, accepted or declined")
+		return
+	}
 	var cursorTime any
 	cursorID := uuid.Nil
 	if requestPage.Cursor != nil {
@@ -203,9 +251,12 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := h.db.QueryContext(r.Context(), inviteQuery()+`
 WHERE (i.from_actor_id = $1 OR i.to_actor_id = $1)
+ AND NOT EXISTS(SELECT 1 FROM relationships b WHERE b.type='block' AND b.state='accepted' AND ((b.actor_id=i.from_actor_id AND b.target_actor_id=i.to_actor_id) OR (b.actor_id=i.to_actor_id AND b.target_actor_id=i.from_actor_id)))
   AND ($2::timestamptz IS NULL OR (i.created_at, i.id) < ($2, $3))
+  AND ($5='' OR ($5='incoming' AND i.to_actor_id=$1) OR ($5='outgoing' AND i.from_actor_id=$1))
+  AND ($6='' OR (i.state=$6 AND ($6<>'pending' OR i.expires_at>now())))
 ORDER BY i.created_at DESC, i.id DESC
-LIMIT $4`, principal.ActorID, cursorTime, cursorID, requestPage.Limit+1)
+LIMIT $4`, principal.ActorID, cursorTime, cursorID, requestPage.Limit+1, direction, state)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "list_invites_failed", err.Error())
 		return
@@ -258,7 +309,8 @@ func (h *Handler) decide(w http.ResponseWriter, r *http.Request, state string) {
 	result, err := h.db.ExecContext(r.Context(), `
 UPDATE invites
 SET state = $3
-WHERE id = $1 AND to_actor_id = $2 AND state = 'pending' AND expires_at > now()`,
+WHERE id = $1 AND to_actor_id = $2 AND state = 'pending' AND expires_at > now()
+ AND NOT EXISTS(SELECT 1 FROM relationships b WHERE b.type='block' AND b.state='accepted' AND ((b.actor_id=invites.from_actor_id AND b.target_actor_id=invites.to_actor_id) OR (b.actor_id=invites.to_actor_id AND b.target_actor_id=invites.from_actor_id)))`,
 		id, principal.ActorID, state)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "invite_decision_failed", err.Error())

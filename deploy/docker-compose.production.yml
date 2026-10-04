@@ -17,7 +17,15 @@ services:
       DATABASE_URL_FILE: /run/secrets/database_url
       REDIS_URL_FILE: /run/secrets/redis_url
       JWT_SECRET_FILE: /run/secrets/jwt_secret
+      ACTOR_KEY_ENCRYPTION_KEY_FILE: /run/secrets/actor_key_encryption_key
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
+      AUTH_RATE_LIMIT_REQUESTS: ${AUTH_RATE_LIMIT_REQUESTS:-20}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      BEEBA_IDENTITY_ENABLED: ${BEEBA_IDENTITY_ENABLED:-false}
+      BEEBA_IDENTITY_API_URL: ${BEEBA_IDENTITY_API_URL:-}
+      BEEBA_IDENTITY_PUBLIC_URL: ${BEEBA_IDENTITY_PUBLIC_URL:-}
+      BEEBA_IDENTITY_SECRET: ${BEEBA_IDENTITY_SECRET:-}
+      BEEBA_IDENTITY_TIMEOUT: ${BEEBA_IDENTITY_TIMEOUT:-3s}
       REGISTRATION_ENABLED: ${REGISTRATION_ENABLED:-false}
       FEDERATION_MODE: ${FEDERATION_MODE:-allowlist}
       ACTIVITYPUB_ENABLED: ${ACTIVITYPUB_ENABLED:-true}
@@ -30,7 +38,7 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       OTEL_TRACES_SAMPLER_RATIO: ${OTEL_TRACES_SAMPLER_RATIO:-0.1}
       REALTIME_REPLAY_ENABLED: "true"
-    secrets: [database_url, redis_url, jwt_secret]
+    secrets: [database_url, redis_url, jwt_secret, actor_key_encryption_key]
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -51,11 +59,12 @@ services:
       DATABASE_URL_FILE: /run/secrets/database_url
       ACTIVITYPUB_FETCH_TIMEOUT: 10s
       ACTIVITYPUB_MAX_DELIVERY_ATTEMPTS: 6
+      ACTOR_KEY_ENCRYPTION_KEY_FILE: /run/secrets/actor_key_encryption_key
       OTEL_TRACING_ENABLED: ${OTEL_TRACING_ENABLED:-false}
       OTEL_SERVICE_NAME: basisvr-social-delivery
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       OTEL_TRACES_SAMPLER_RATIO: ${OTEL_TRACES_SAMPLER_RATIO:-0.1}
-    secrets: [database_url]
+    secrets: [database_url, actor_key_encryption_key]
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -112,6 +121,9 @@ secrets:
     file: ${REDIS_URL_SECRET_FILE:?Set REDIS_URL_SECRET_FILE}
   jwt_secret:
     file: ${JWT_SECRET_FILE:?Set JWT_SECRET_FILE}
+
+  actor_key_encryption_key:
+    file: ${ACTOR_KEY_ENCRYPTION_KEY_FILE:?Set ACTOR_KEY_ENCRYPTION_KEY_FILE}
 
 volumes:
   caddy_data:

@@ -2,7 +2,6 @@ package privacy
 
 import (
 	"context"
-	"database/sql"
 	"strings"
 
 	"github.com/google/uuid"
@@ -36,7 +35,7 @@ type ViewInput struct {
 	Visibility    string
 }
 
-func CanView(ctx context.Context, db *sql.DB, input ViewInput) (bool, error) {
+func CanView(ctx context.Context, db Querier, input ViewInput) (bool, error) {
 	visibility := strings.ToLower(strings.TrimSpace(input.Visibility))
 	if visibility == "" || visibility == "public" {
 		return true, nil
@@ -60,7 +59,7 @@ func CanView(ctx context.Context, db *sql.DB, input ViewInput) (bool, error) {
 	}
 }
 
-func exists(ctx context.Context, db *sql.DB, query string, args ...any) (bool, error) {
+func exists(ctx context.Context, db Querier, query string, args ...any) (bool, error) {
 	var ok bool
 	err := db.QueryRowContext(ctx, query, args...).Scan(&ok)
 	return ok, err

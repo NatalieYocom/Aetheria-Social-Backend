@@ -34,6 +34,7 @@ func TestAuthorizedFetchReturnsFollowersWorldOnlyToSignedFollower(t *testing.T) 
 	}
 
 	cfg := config.Load()
+	cfg.ActivityPub.ActorKeyEncryptionKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 	cfg.Database.URL = databaseURL
 	cfg.Server.PublicURL = "https://social.integration.test"
 	cfg.ActivityPub.Domain = "social.integration.test"

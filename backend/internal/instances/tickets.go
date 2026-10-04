@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"math/big"
 	"net"
 	"net/http"
 	"strings"
@@ -32,15 +33,15 @@ const (
 const insertJoinTicketSQL = `
 INSERT INTO instance_join_tickets (
   token_hash, actor_id, instance_id, presence_visibility,
-  show_exact_instance, metadata, expires_at
+  show_exact_instance, metadata, expires_at, client_did
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING id`
 
 const loadJoinTicketForConsumeSQL = `
 SELECT jt.id, jt.actor_id, jt.instance_id, jt.presence_visibility,
        jt.show_exact_instance, jt.metadata, jt.expires_at, jt.consumed_at,
-       a.acct, u.status
+       a.acct, u.status, COALESCE(jt.client_did,'')
 FROM instance_join_tickets jt
 JOIN actors a ON a.id = jt.actor_id
 JOIN users u ON u.id = a.local_user_id
@@ -70,6 +71,7 @@ ORDER BY created_at DESC, id DESC
 LIMIT $3`
 
 type issueJoinTicketRequest struct {
+	ClientDID          string         `json:"clientDid"`
 	PresenceVisibility string         `json:"presenceVisibility"`
 	ShowExactInstance  bool           `json:"showExactInstance"`
 	Metadata           map[string]any `json:"metadata"`
@@ -82,15 +84,19 @@ type JoinTicketResponse struct {
 }
 
 type consumeJoinTicketRequest struct {
-	Ticket string `json:"ticket"`
+	InstanceID uuid.UUID `json:"instanceId"`
+	ClientDID  string    `json:"clientDid"`
+	Ticket     string    `json:"ticket"`
 }
 
 type ConsumeJoinTicketResponse struct {
-	State             string           `json:"state"`
-	ActorID           uuid.UUID        `json:"actorId"`
-	Acct              string           `json:"acct"`
-	PresenceExpiresAt time.Time        `json:"presenceExpiresAt"`
-	Instance          InstanceResponse `json:"instance"`
+	PresenceVisibility string           `json:"presenceVisibility"`
+	ShowExactInstance  bool             `json:"showExactInstance"`
+	State              string           `json:"state"`
+	ActorID            uuid.UUID        `json:"actorId"`
+	Acct               string           `json:"acct"`
+	PresenceExpiresAt  time.Time        `json:"presenceExpiresAt"`
+	Instance           InstanceResponse `json:"instance"`
 }
 
 type createWorldServerCredentialRequest struct {
@@ -131,6 +137,7 @@ type worldServerIdentity struct {
 }
 
 type consumableJoinTicket struct {
+	clientDID          string
 	id                 uuid.UUID
 	actorID            uuid.UUID
 	instanceID         uuid.UUID
@@ -158,6 +165,10 @@ func (h *Handler) IssueJoinTicket(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
+	if !validClientDID(req.ClientDID) {
+		httpx.WriteError(w, 400, "invalid_client_did", "clientDid must be a canonical Ed25519 did:key")
+		return
+	}
 	visibility := normalizePresenceVisibility(req.PresenceVisibility)
 	if visibility == "" {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_presence_visibility", "presenceVisibility must be nobody, friends, followers or public")
@@ -181,6 +192,10 @@ func (h *Handler) IssueJoinTicket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
+	if err := lockActor(r.Context(), tx, principal.ActorID); err != nil {
+		httpx.WriteError(w, 500, "issue_join_ticket_failed", err.Error())
+		return
+	}
 	target, err := h.loadJoinTarget(r.Context(), tx, instanceID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -222,7 +237,7 @@ WHERE actor_id = $1 AND instance_id = $2 AND consumed_at IS NULL`, principal.Act
 	var ticketID uuid.UUID
 	if err := tx.QueryRowContext(r.Context(), insertJoinTicketSQL,
 		hashOpaqueToken(rawToken), principal.ActorID, instanceID, visibility,
-		req.ShowExactInstance, metadata, expiresAt,
+		req.ShowExactInstance, metadata, expiresAt, req.ClientDID,
 	).Scan(&ticketID); err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "issue_join_ticket_failed", err.Error())
 		return
@@ -249,6 +264,14 @@ func (h *Handler) ConsumeJoinTicket(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
+	if req.InstanceID == uuid.Nil {
+		httpx.WriteError(w, 400, "invalid_instance", "instanceId is required")
+		return
+	}
+	if !validClientDID(req.ClientDID) {
+		httpx.WriteError(w, 400, "invalid_client_did", "clientDid must be a canonical Ed25519 did:key")
+		return
+	}
 	req.Ticket = strings.TrimSpace(req.Ticket)
 	if !strings.HasPrefix(req.Ticket, joinTicketPrefix) {
 		h.recordJoinAudit(r, identity, nil, "invalid_ticket")
@@ -262,6 +285,22 @@ func (h *Handler) ConsumeJoinTicket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
+	// Lock actor before ticket, matching issuance invalidation order. Otherwise an
+	// issue/consume race can deadlock (actor -> ticket vs ticket -> actor).
+	var actorID uuid.UUID
+	if err = tx.QueryRowContext(r.Context(), `SELECT actor_id FROM instance_join_tickets WHERE token_hash=$1`, hashOpaqueToken(req.Ticket)).Scan(&actorID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			h.rollbackAndRecordJoinAudit(r, tx, identity, nil, "invalid_ticket")
+			httpx.WriteError(w, 404, "invalid_ticket", "join ticket is invalid")
+		} else {
+			httpx.WriteError(w, 500, "consume_join_ticket_failed", err.Error())
+		}
+		return
+	}
+	if err = lockActor(r.Context(), tx, actorID); err != nil {
+		httpx.WriteError(w, 500, "consume_join_ticket_failed", err.Error())
+		return
+	}
 	ticket, err := loadConsumableJoinTicket(r, tx, hashOpaqueToken(req.Ticket))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -270,6 +309,16 @@ func (h *Handler) ConsumeJoinTicket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		httpx.WriteError(w, http.StatusInternalServerError, "consume_join_ticket_failed", err.Error())
+		return
+	}
+	if ticket.instanceID != req.InstanceID {
+		h.rollbackAndRecordJoinAudit(r, tx, identity, &ticket, "instance_mismatch")
+		httpx.WriteError(w, 409, "ticket_instance_mismatch", "ticket targets another instance")
+		return
+	}
+	if ticket.clientDID != req.ClientDID {
+		h.rollbackAndRecordJoinAudit(r, tx, identity, &ticket, "identity_mismatch")
+		httpx.WriteError(w, 409, "ticket_identity_mismatch", "ticket belongs to another client key")
 		return
 	}
 	if ticket.consumedAt.Valid {
@@ -287,12 +336,9 @@ func (h *Handler) ConsumeJoinTicket(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusForbidden, "user_inactive", "user is not active")
 		return
 	}
-	if err := lockActor(r.Context(), tx, ticket.actorID); err != nil {
-		httpx.WriteError(w, http.StatusInternalServerError, "consume_join_ticket_failed", err.Error())
-		return
-	}
+
 	target, err := h.loadJoinTarget(r.Context(), tx, ticket.instanceID)
-	if err != nil || !target.active() {
+	if err != nil || !target.active() || !target.expiresAt.Valid {
 		h.rollbackAndRecordJoinAudit(r, tx, identity, &ticket, "instance_inactive")
 		httpx.WriteError(w, http.StatusConflict, "instance_not_active", "instance is not active")
 		return
@@ -384,7 +430,7 @@ WHERE id = $1 AND consumed_at IS NULL`, ticket.id, identity.id); err != nil {
 	}
 	_ = realtime.PublishInstanceChanged(r.Context(), h.db, h.events, ticket.instanceID, "instance.updated")
 	httpx.WriteJSON(w, http.StatusOK, ConsumeJoinTicketResponse{
-		State: "joined", ActorID: ticket.actorID, Acct: ticket.acct,
+		State: "joined", ActorID: ticket.actorID, Acct: ticket.acct, PresenceVisibility: ticket.presenceVisibility, ShowExactInstance: ticket.showExactInstance,
 		PresenceExpiresAt: presenceExpiresAt, Instance: instance,
 	})
 }
@@ -597,7 +643,7 @@ func loadConsumableJoinTicket(r *http.Request, tx *sql.Tx, hash string) (consuma
 	err := tx.QueryRowContext(r.Context(), loadJoinTicketForConsumeSQL, hash).Scan(
 		&ticket.id, &ticket.actorID, &ticket.instanceID, &ticket.presenceVisibility,
 		&ticket.showExactInstance, &ticket.metadata, &ticket.expiresAt,
-		&ticket.consumedAt, &ticket.acct, &ticket.localUserStatus,
+		&ticket.consumedAt, &ticket.acct, &ticket.localUserStatus, &ticket.clientDID,
 	)
 	return ticket, err
 }
@@ -687,4 +733,28 @@ func requestIP(r *http.Request) string {
 		return host
 	}
 	return value
+}
+
+// Canonical Ed25519 multicodec (0xed, 0x01) and exactly 32 key bytes, base58btc.
+func validClientDID(value string) bool {
+	if !strings.HasPrefix(value, "did:key:z") || len(value) > 64 {
+		return false
+	}
+	encoded := strings.TrimPrefix(value, "did:key:z")
+	if len(encoded) != 47 {
+		return false
+	}
+	n := new(big.Int)
+	radix := big.NewInt(58)
+	const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+	for _, char := range encoded {
+		digit := strings.IndexRune(alphabet, char)
+		if digit < 0 {
+			return false
+		}
+		n.Mul(n, radix)
+		n.Add(n, big.NewInt(int64(digit)))
+	}
+	decoded := n.Bytes()
+	return len(decoded) == 34 && decoded[0] == 0xed && decoded[1] == 0x01
 }

@@ -172,6 +172,16 @@ RETURNING id`,
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
+	h.list(w, r, false)
+}
+
+// ListOwned shares the same bounded cursor/DTO path and includes private worlds
+// only for the authenticated owner. Mounted on the scoped BeeBa bridge.
+func (h *Handler) ListOwned(w http.ResponseWriter, r *http.Request) {
+	h.list(w, r, true)
+}
+
+func (h *Handler) list(w http.ResponseWriter, r *http.Request, owned bool) {
 	requestPage, err := page.ParseRequest(r, 24, 100)
 	if err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_pagination", err.Error())
@@ -183,7 +193,18 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		cursorTime = requestPage.Cursor.SortTime
 		cursorID = requestPage.Cursor.ID
 	}
-	rows, err := h.db.QueryContext(r.Context(), listWorldsSQL, cursorTime, cursorID, requestPage.Limit+1)
+	query := listWorldsSQL
+	args := []any{cursorTime, cursorID, requestPage.Limit + 1}
+	if owned {
+		principal, ok := auth.PrincipalFromContext(r.Context())
+		if !ok {
+			httpx.WriteError(w, 401, "unauthorized", "Authentication required.")
+			return
+		}
+		query = strings.Replace(listWorldsSQL, "w.visibility = 'public'", "w.owner_actor_id = $4", 1)
+		args = append(args, principal.ActorID)
+	}
+	rows, err := h.db.QueryContext(r.Context(), query, args...)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "list_worlds_failed", err.Error())
 		return

@@ -53,7 +53,7 @@ func TestFriendsPresenceQueryExcludesInvisibleStatus(t *testing.T) {
 	router := newPresenceTestRouter(db)
 
 	mock.ExpectQuery("ps.status <> 'invisible'").
-		WithArgs(testPrincipal.ActorID).
+		WithArgs(testPrincipal.ActorID, nil, uuid.Nil, 51).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id",
 			"actor_id",

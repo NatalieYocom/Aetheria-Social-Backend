@@ -12,6 +12,7 @@ import (
 
 	"basisvr-social-service/internal/activitypub"
 	activityoutbox "basisvr-social-service/internal/activitypub/outbox"
+	"basisvr-social-service/internal/actorcrypto"
 	"basisvr-social-service/internal/auth"
 	"basisvr-social-service/internal/common/httpx"
 	"basisvr-social-service/internal/common/page"
@@ -23,15 +24,16 @@ import (
 )
 
 type Handler struct {
-	db        *sql.DB
-	publicURL string
-	events    *realtime.Broker
-	outbox    *activityoutbox.Service
+	db                    *sql.DB
+	publicURL             string
+	actorKeyEncryptionKey string
+	events                *realtime.Broker
+	outbox                *activityoutbox.Service
 }
 
-func NewHandler(db *sql.DB, publicURL string, events *realtime.Broker) *Handler {
+func NewHandler(db *sql.DB, publicURL string, events *realtime.Broker, actorKeyEncryptionKey string) *Handler {
 	publicURL = strings.TrimRight(publicURL, "/")
-	return &Handler{db: db, publicURL: publicURL, events: events, outbox: activityoutbox.NewService(db, publicURL)}
+	return &Handler{actorKeyEncryptionKey: actorKeyEncryptionKey, db: db, publicURL: publicURL, events: events, outbox: activityoutbox.NewService(db, publicURL)}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler, authMiddleware func(http.Handler) http.Handler) {
@@ -171,8 +173,13 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	meta := activitypub.BuildLocalGroupActorMetadata(activitypub.LocalActorInput{
 		PublicURL: h.publicURL, Username: req.Slug, DisplayName: req.Name, Bio: req.Description,
-		AvatarURL: req.AvatarURL, PublicKeyPEM: keyPair.PublicKeyPEM, PrivateKeyEncrypted: keyPair.PrivateKeyPEM,
+		AvatarURL: req.AvatarURL, PublicKeyPEM: keyPair.PublicKeyPEM,
 	})
+	meta.PrivateKeyEncrypted, err = actorcrypto.Encrypt(h.actorKeyEncryptionKey, meta.ActorURI, keyPair.PrivateKeyPEM)
+	if err != nil {
+		httpx.WriteError(w, 500, "group_key_failed", "could not encrypt actor key")
+		return
+	}
 	rawJSON, err := json.Marshal(activitypub.BuildGroupActorDocument(meta))
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "group_actor_failed", err.Error())

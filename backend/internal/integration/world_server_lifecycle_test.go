@@ -39,6 +39,7 @@ func TestWorldServerLifecycle(t *testing.T) {
 	}
 
 	cfg := config.Load()
+	cfg.ActivityPub.ActorKeyEncryptionKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 	cfg.Database.URL = databaseURL
 	cfg.Server.PublicURL = "https://social.integration.test"
 	cfg.ActivityPub.Domain = "social.integration.test"
@@ -197,21 +198,22 @@ func TestWorldServerLifecycle(t *testing.T) {
 		"/api/v1/admin/world-server-credentials?limit=1&cursor="+url.QueryEscape(credentialCursor),
 		session.AccessToken, "", nil, http.StatusOK), 1)
 
+	requestJSON(t, router, http.MethodPut, "/api/v1/admin/instances/"+instance.ID.String()+"/world-server", session.AccessToken, "", map[string]any{"credentialId": credential.ID}, http.StatusNoContent)
 	requestJSON(t, router, http.MethodPost, "/api/v1/service/instances/"+instance.ID.String()+"/heartbeat", "", credential.Token,
 		map[string]any{"ttlSeconds": 120}, http.StatusOK)
 	ticketBody := requestJSON(t, router, http.MethodPost, "/api/v1/instances/"+instance.ID.String()+"/join-tickets", session.AccessToken, "",
-		map[string]any{"presenceVisibility": "friends", "showExactInstance": true}, http.StatusCreated)
+		map[string]any{"presenceVisibility": "friends", "showExactInstance": true, "clientDid": "did:key:z6MkeTGwHmLmuCmgg4ABYhzWVh6ZX7hTwWt8gguAretUfc9c"}, http.StatusCreated)
 	var ticket struct {
 		Ticket string `json:"ticket"`
 	}
 	decodeResponse(t, ticketBody, &ticket)
 	requestJSON(t, router, http.MethodPost, "/api/v1/service/instance-join-tickets/consume", "", credential.Token,
-		map[string]any{"ticket": ticket.Ticket}, http.StatusOK)
+		map[string]any{"ticket": ticket.Ticket, "instanceId": instance.ID, "clientDid": "did:key:z6MkeTGwHmLmuCmgg4ABYhzWVh6ZX7hTwWt8gguAretUfc9c"}, http.StatusOK)
 	secondTicketBody := requestJSON(t, router, http.MethodPost, "/api/v1/instances/"+instance.ID.String()+"/join-tickets", session.AccessToken, "",
-		map[string]any{"presenceVisibility": "friends", "showExactInstance": true}, http.StatusCreated)
+		map[string]any{"presenceVisibility": "friends", "showExactInstance": true, "clientDid": "did:key:z6MkeTGwHmLmuCmgg4ABYhzWVh6ZX7hTwWt8gguAretUfc9c"}, http.StatusCreated)
 	decodeResponse(t, secondTicketBody, &ticket)
 	requestJSON(t, router, http.MethodPost, "/api/v1/service/instance-join-tickets/consume", "", credential.Token,
-		map[string]any{"ticket": ticket.Ticket}, http.StatusOK)
+		map[string]any{"ticket": ticket.Ticket, "instanceId": instance.ID, "clientDid": "did:key:z6MkeTGwHmLmuCmgg4ABYhzWVh6ZX7hTwWt8gguAretUfc9c"}, http.StatusOK)
 	auditCursor := assertCursorPage(t, requestJSON(t, router, http.MethodGet,
 		"/api/v1/admin/instance-join-audit?limit=1", session.AccessToken, "", nil, http.StatusOK))
 	assertPageSize(t, requestJSON(t, router, http.MethodGet,
@@ -274,6 +276,7 @@ func TestAccountExportAndDeletionLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.Load()
+	cfg.ActivityPub.ActorKeyEncryptionKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 	cfg.Database.URL = databaseURL
 	cfg.Server.PublicURL = "https://social.integration.test"
 	cfg.ActivityPub.Domain = "social.integration.test"
@@ -481,6 +484,9 @@ func assertRuntimeState(t *testing.T, db *sql.DB, instanceID, actorID, credentia
 
 func migrationsPath(t *testing.T) string {
 	t.Helper()
+	if path := os.Getenv("BASIS_INTEGRATION_MIGRATIONS_DIR"); path != "" {
+		return path
+	}
 	_, filename, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("locate integration test source")

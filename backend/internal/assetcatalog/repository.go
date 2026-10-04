@@ -3,6 +3,7 @@ package assetcatalog
 import (
 	"context"
 	"database/sql"
+	"net/http"
 
 	"basisvr-social-service/internal/common/dbx"
 
@@ -18,12 +19,12 @@ const listWorldAssetsSQL = `
 SELECT ar.id, ar.catalog_id, ar.external_id, ar.external_url, ar.content_type, ar.title, ar.description,
        ar.preview_url, ar.download_url, ar.author_name, ar.license, ar.nsfw, ar.tags, ar.metadata,
        c.code, c.name, c.kind, c.base_url, c.api_base_url,
-       war.role, war.sort_order, war.metadata
+       war.role, war.sort_order, war.metadata, c.enabled, COALESCE(war.pinned_version_id::text,'')
 FROM world_asset_refs war
 JOIN asset_refs ar ON ar.id = war.asset_ref_id
 JOIN asset_catalogs c ON c.id = ar.catalog_id
 WHERE war.world_id = $1
-ORDER BY war.sort_order ASC, ar.title ASC`
+ORDER BY war.sort_order ASC, ar.title ASC LIMIT 51`
 
 type repository struct {
 	db *sql.DB
@@ -132,27 +133,59 @@ RETURNING id, catalog_id, external_id, external_url, content_type, title, descri
 		dbx.PostgresTextArray(asset.Tags),
 		metadata,
 	)
-	return scanAssetRef(row, catalog)
+	ref, err := scanAssetRef(row, catalog)
+	if err == nil {
+		ref.Asset = asset
+	}
+	return ref, err
 }
 
-func (r repository) attachWorldAsset(ctx context.Context, worldID uuid.UUID, assetID uuid.UUID, role string, sortOrder int, metadata map[string]any) error {
+func (r repository) attachWorldAsset(ctx context.Context, worldID uuid.UUID, actorID uuid.UUID, ref AssetRef, role string, sortOrder int, metadata map[string]any) error {
 	rawMetadata, err := dbx.MarshalJSON(metadata, "{}")
 	if err != nil {
 		return err
 	}
-	_, err = r.db.ExecContext(ctx, `
-INSERT INTO world_asset_refs (world_id, asset_ref_id, role, sort_order, metadata)
-VALUES ($1, $2, $3, $4, $5)
-ON CONFLICT (world_id, asset_ref_id, role)
-DO UPDATE SET sort_order = EXCLUDED.sort_order,
-              metadata = EXCLUDED.metadata`,
-		worldID,
-		assetID,
-		role,
-		sortOrder,
-		rawMetadata,
-	)
-	return err
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var owner uuid.UUID
+	if err = tx.QueryRowContext(ctx, `SELECT owner_actor_id FROM worlds WHERE id=$1 FOR UPDATE`, worldID).Scan(&owner); err != nil {
+		return err
+	}
+	if owner != actorID {
+		return requestError{http.StatusForbidden, "forbidden", "only owner can modify world assets"}
+	}
+	var count int
+	var exists bool
+	if err = tx.QueryRowContext(ctx, `SELECT count(*),COALESCE(bool_or(asset_ref_id=$2 AND role=$3),false) FROM world_asset_refs WHERE world_id=$1`, worldID, ref.ID, role).Scan(&count, &exists); err != nil {
+		return err
+	}
+	if count >= 50 && !exists {
+		return requestError{http.StatusConflict, "asset_limit", "a world may reference at most 50 assets"}
+	}
+	if role == WorldAssetRolePrimary {
+		var other bool
+		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM world_asset_refs WHERE world_id=$1 AND role='primary' AND asset_ref_id<>$2)`, worldID, ref.ID).Scan(&other); err != nil {
+			return err
+		}
+		if other {
+			return requestError{http.StatusConflict, "primary_asset_exists", "detach the current primary asset first"}
+		}
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO world_asset_refs(world_id,asset_ref_id,role,sort_order,metadata,pinned_version_id) VALUES($1,$2,$3,$4,$5,$6)
+ ON CONFLICT(world_id,asset_ref_id,role) DO UPDATE SET sort_order=EXCLUDED.sort_order,metadata=EXCLUDED.metadata,pinned_version_id=EXCLUDED.pinned_version_id`, worldID, ref.ID, role, sortOrder, rawMetadata, ref.Asset.VersionID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r repository) assetIdentity(ctx context.Context, id uuid.UUID) (string, string, error) {
+	var code, externalID string
+	err := r.db.QueryRowContext(ctx, `SELECT c.code,a.external_id FROM asset_refs a JOIN asset_catalogs c ON c.id=a.catalog_id WHERE a.id=$1`, id).Scan(&code, &externalID)
+	return code, externalID, err
 }
 
 func (r repository) detachWorldAsset(ctx context.Context, worldID uuid.UUID, assetID uuid.UUID) error {
@@ -291,11 +324,12 @@ func scanWorldAsset(row scanner) (WorldAsset, error) {
 		&asset.Role,
 		&asset.SortOrder,
 		&linkMetadataRaw,
+		&catalog.Enabled,
+		&asset.PinnedVersionID,
 	); err != nil {
 		return WorldAsset{}, err
 	}
 	catalog.ID = catalogID
-	catalog.Enabled = true
 	catalog.Metadata = map[string]any{}
 	asset.Asset.Catalog = catalog
 	asset.Asset.Asset.Tags = []string(tags)

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	activitypub "basisvr-social-service/internal/activitypub"
+	"basisvr-social-service/internal/actorcrypto"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/google/uuid"
@@ -145,7 +146,7 @@ func TestWorkerDeliversDueJobAndMarksDelivered(t *testing.T) {
 			[]byte(`{"id":"https://basis.example/activities/accept-1","type":"Accept"}`),
 			"https://basis.example/activities/accept-1",
 			"https://basis.example/users/bob",
-			keyPair.PrivateKeyPEM,
+			encryptedDeliveryTestKey(t, keyPair.PrivateKeyPEM),
 		))
 	mock.ExpectQuery(regexp.QuoteMeta(blockedDomainExistsSQL)).
 		WithArgs("remote.example").
@@ -155,7 +156,7 @@ func TestWorkerDeliversDueJobAndMarksDelivered(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
-	worker := NewWorker(db, client, 6)
+	worker := NewWorker(db, client, 6, "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
 	delivered, err := worker.DeliverDueOne(context.Background())
 	if err != nil {
 		t.Fatalf("DeliverDueOne returned error: %v", err)
@@ -198,13 +199,13 @@ func TestWorkerRetriesRejectedLegacyDeliveryWithRFC9421(t *testing.T) {
 		"job_id", "activity_id", "target_inbox_url", "attempts", "raw_json", "activity_uri", "actor_uri", "private_key_pem_encrypted",
 	}).AddRow(jobID, activityID, "https://remote.example/inbox", 0,
 		[]byte(`{"id":"https://basis.example/activities/1","type":"Create"}`),
-		"https://basis.example/activities/1", "https://basis.example/users/bob", keyPair.PrivateKeyPEM))
+		"https://basis.example/activities/1", "https://basis.example/users/bob", encryptedDeliveryTestKey(t, keyPair.PrivateKeyPEM)))
 	mock.ExpectQuery(regexp.QuoteMeta(blockedDomainExistsSQL)).WithArgs("remote.example").
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectExec("UPDATE outbox_jobs").WithArgs(jobID).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
-	delivered, err := NewWorker(db, client, 6).DeliverDueOne(context.Background())
+	delivered, err := NewWorker(db, client, 6, "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=").DeliverDueOne(context.Background())
 	if err != nil || !delivered {
 		t.Fatalf("delivered = %v, error = %v", delivered, err)
 	}
@@ -246,7 +247,7 @@ func TestWorkerMarksBlockedDomainJobFailedWithoutSending(t *testing.T) {
 			[]byte(`{"id":"https://basis.example/activities/accept-1","type":"Accept"}`),
 			"https://basis.example/activities/accept-1",
 			"https://basis.example/users/bob",
-			keyPair.PrivateKeyPEM,
+			encryptedDeliveryTestKey(t, keyPair.PrivateKeyPEM),
 		))
 	mock.ExpectQuery(regexp.QuoteMeta(blockedDomainExistsSQL)).
 		WithArgs("blocked.example").
@@ -259,7 +260,7 @@ func TestWorkerMarksBlockedDomainJobFailedWithoutSending(t *testing.T) {
 	worker := NewWorker(db, &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		clientCalled = true
 		return nil, nil
-	})}, 6)
+	})}, 6, "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
 	delivered, err := worker.DeliverDueOne(context.Background())
 	if err != nil {
 		t.Fatalf("DeliverDueOne returned error: %v", err)
@@ -291,4 +292,13 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func encryptedDeliveryTestKey(t *testing.T, value string) string {
+	t.Helper()
+	encrypted, err := actorcrypto.Encrypt("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", "https://basis.example/users/bob", value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encrypted
 }

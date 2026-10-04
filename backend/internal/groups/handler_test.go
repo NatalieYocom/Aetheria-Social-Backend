@@ -47,7 +47,7 @@ func TestAddWorldPublishesGroupAnnounceInSameTransaction(t *testing.T) {
 	mock.ExpectQuery("SELECT actor_id FROM group_members").WithArgs(groupID).
 		WillReturnRows(sqlmock.NewRows([]string{"actor_id"}))
 
-	handler := NewHandler(db, "https://social.example", nil)
+	handler := NewHandler(db, "https://social.example", nil, "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
 	router := chi.NewRouter()
 	router.Post("/api/groups/{id}/worlds", func(w http.ResponseWriter, r *http.Request) {
 		principal := auth.Principal{UserID: uuid.New(), ActorID: managerID, Username: "alice"}

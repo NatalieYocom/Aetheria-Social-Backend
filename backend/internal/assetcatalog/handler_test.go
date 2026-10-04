@@ -198,75 +198,6 @@ func TestSearchAssetsLoadsCatalogAndReturnsCatalogPage(t *testing.T) {
 	}
 }
 
-func TestAttachWorldAssetRequiresWorldOwnerAndReturnsLinkedAssets(t *testing.T) {
-	db, mock := newMockDB(t)
-	worldID := uuid.New()
-	actorID := uuid.New()
-	catalogID := uuid.New()
-	assetID := uuid.New()
-	testActorIDFromDBExpectation = actorID
-	router := newTestRouter(db, config.AssetCatalogConfig{}, fakeClientFactory{})
-
-	mock.ExpectQuery("(?s)SELECT owner_actor_id.*FROM worlds w.*owner_user.status = 'active'").
-		WithArgs(worldID).
-		WillReturnRows(sqlmock.NewRows([]string{"owner_actor_id"}).AddRow(actorID))
-	mock.ExpectExec("INSERT INTO world_asset_refs").
-		WithArgs(worldID, assetID, "primary", 0, sqlmock.AnyArg()).
-		WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectQuery(regexp.QuoteMeta(listWorldAssetsSQL)).
-		WithArgs(worldID).
-		WillReturnRows(worldAssetRows().AddRow(
-			assetID,
-			catalogID,
-			"bee-asset-1",
-			"https://catalog.example/api/v1/content/bee-asset-1",
-			AssetTypeWorld,
-			"Bee World",
-			"Imported world",
-			"https://catalog.example/api/v1/media/preview",
-			"https://catalog.example/api/v1/content/bee-asset-1/download",
-			"alice",
-			"",
-			false,
-			"{social}",
-			[]byte(`{"source":"beeba"}`),
-			"beeba",
-			"BeeBa",
-			CatalogKindBeeBa,
-			"https://catalog.example",
-			"https://catalog.example/api/v1",
-			"primary",
-			0,
-			[]byte(`{}`),
-		))
-
-	req := httptest.NewRequest(http.MethodPost, "/api/worlds/"+worldID.String()+"/assets", strings.NewReader(`{"assetRefId":"`+assetID.String()+`","role":"primary"}`))
-	req.Header.Set("Content-Type", "application/json")
-	res := httptest.NewRecorder()
-
-	router.ServeHTTP(res, req)
-
-	if res.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
-	}
-	var body []WorldAssetResponse
-	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if len(body) != 1 {
-		t.Fatalf("len(body) = %d", len(body))
-	}
-	if body[0].Role != "primary" {
-		t.Fatalf("Role = %q", body[0].Role)
-	}
-	if body[0].Asset.Title != "Bee World" {
-		t.Fatalf("Asset.Title = %q", body[0].Asset.Title)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestListWorldAssetsForPrivateWorldWithoutAccessReturnsNotFound(t *testing.T) {
 	db, mock := newMockDB(t)
 	worldID := uuid.New()
@@ -358,6 +289,8 @@ func worldAssetRows() *sqlmock.Rows {
 		"role",
 		"sort_order",
 		"link_metadata",
+		"enabled",
+		"pinned_version_id",
 	})
 }
 

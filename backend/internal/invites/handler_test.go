@@ -29,7 +29,7 @@ func TestListInvitesReturnsCursorEnvelope(t *testing.T) {
 	toActorID := uuid.New()
 
 	mock.ExpectQuery("FROM invites i").
-		WithArgs(testPrincipal.ActorID, nil, uuid.Nil, 2).
+		WithArgs(testPrincipal.ActorID, nil, uuid.Nil, 2, "", "").
 		WillReturnRows(inviteRows().
 			AddRow(firstInviteID, fromActorID, "from@example.social", "From", toActorID, "to@example.social", "To", nil, nil, nil, "", "direct", "pending", createdAt.Add(time.Hour), createdAt).
 			AddRow(uuid.New(), fromActorID, "from@example.social", "From", toActorID, "to@example.social", "To", nil, nil, nil, "", "direct", "pending", createdAt.Add(time.Hour), createdAt.Add(-time.Second)))
@@ -75,6 +75,9 @@ func TestCreateInviteCreatesDurableNotification(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(worldAccessTargetSQL)).
 		WithArgs(worldID).
 		WillReturnRows(sqlmock.NewRows([]string{"owner_actor_id", "visibility"}).AddRow(worldOwnerID, "public"))
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT id FROM actors.*ORDER BY id FOR UPDATE").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(testPrincipal.ActorID).AddRow(toActorID))
+	mock.ExpectQuery("SELECT EXISTS.*type = 'block'").WillReturnRows(sqlmock.NewRows([]string{"blocked"}).AddRow(false))
 	mock.ExpectQuery("INSERT INTO invites").
 		WithArgs(testPrincipal.ActorID, toActorID, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), "join me", "direct", sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(inviteID))
@@ -101,6 +104,7 @@ func TestCreateInviteCreatesDurableNotification(t *testing.T) {
 		WithArgs(toActorID, "invite.created", sqlmock.AnyArg()).
 		WillReturnRows(notificationRows().AddRow(notificationID, toActorID, "invite.created", []byte(`{"state":"pending"}`), nil, createdAt))
 
+	mock.ExpectCommit()
 	req := httptest.NewRequest(http.MethodPost, "/api/invites", strings.NewReader(`{"toActorId":"`+toActorID.String()+`","worldId":"`+worldID.String()+`","message":"join me"}`))
 	req.Header.Set("Content-Type", "application/json")
 	res := httptest.NewRecorder()
@@ -253,5 +257,20 @@ func assertEventEventually(t *testing.T, events <-chan realtime.Event, eventType
 		case <-deadline:
 			t.Fatalf("timed out waiting for %s", eventType)
 		}
+	}
+}
+
+func TestListInvitesRejectsInvalidFilters(t *testing.T) {
+	db, mock := newMockDB(t)
+	router := newTestRouter(db, nil)
+	for _, query := range []string{"state=invalid", "direction=invalid"} {
+		res := httptest.NewRecorder()
+		router.ServeHTTP(res, httptest.NewRequest("GET", "/api/invites?"+query, nil))
+		if res.Code != 400 {
+			t.Fatalf("%s status%d", query, res.Code)
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }

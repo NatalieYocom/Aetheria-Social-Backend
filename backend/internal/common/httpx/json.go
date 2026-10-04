@@ -38,6 +38,9 @@ func WriteJSON(w http.ResponseWriter, status int, body any) {
 }
 
 func WriteError(w http.ResponseWriter, status int, code string, message string) {
+	if status >= 500 {
+		message = "The service could not complete the request."
+	}
 	WriteJSON(w, status, ErrorBody{
 		Error: APIError{
 			Code:    code,
