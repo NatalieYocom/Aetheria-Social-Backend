@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"basisvr-social-service/internal/actorcrypto"
 	"basisvr-social-service/internal/config"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -26,7 +27,7 @@ func TestInstanceSignedClientSignsServerGET(t *testing.T) {
 	mock.ExpectQuery("SELECT actor_uri, public_key_pem, private_key_pem_encrypted").
 		WithArgs("https://social.example/actor").
 		WillReturnRows(sqlmock.NewRows([]string{"actor_uri", "public_key_pem", "private_key_pem_encrypted"}).
-			AddRow("https://social.example/actor", keyPair.PublicKeyPEM, keyPair.PrivateKeyPEM))
+			AddRow("https://social.example/actor", keyPair.PublicKeyPEM, encryptedInstanceTestKey(t, keyPair.PrivateKeyPEM)))
 	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if req.Header.Get("Signature-Input") == "" || req.Header.Get("Signature") == "" {
 			t.Fatalf("signed headers are missing: %v", req.Header)
@@ -35,7 +36,7 @@ func TestInstanceSignedClientSignsServerGET(t *testing.T) {
 			StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: req,
 		}, nil
 	})
-	cfg := config.Config{Server: config.ServerConfig{PublicURL: "https://social.example"}}
+	cfg := config.Config{ActivityPub: config.ActivityPubConfig{ActorKeyEncryptionKey: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="}, Server: config.ServerConfig{PublicURL: "https://social.example"}}
 	client := NewInstanceSignedClient(db, cfg, base)
 
 	res, err := client.Get("https://remote.example/actor")
@@ -61,7 +62,7 @@ func TestInstanceSignedClientRetriesUnauthorizedGETWithLegacySignature(t *testin
 	mock.ExpectQuery("SELECT actor_uri, public_key_pem, private_key_pem_encrypted").
 		WithArgs("https://social.example/actor").
 		WillReturnRows(sqlmock.NewRows([]string{"actor_uri", "public_key_pem", "private_key_pem_encrypted"}).
-			AddRow("https://social.example/actor", keyPair.PublicKeyPEM, keyPair.PrivateKeyPEM))
+			AddRow("https://social.example/actor", keyPair.PublicKeyPEM, encryptedInstanceTestKey(t, keyPair.PrivateKeyPEM)))
 	attempts := 0
 	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		attempts++
@@ -76,7 +77,7 @@ func TestInstanceSignedClientRetriesUnauthorizedGETWithLegacySignature(t *testin
 		}
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
 	})
-	client := NewInstanceSignedClient(db, config.Config{Server: config.ServerConfig{PublicURL: "https://social.example"}}, base)
+	client := NewInstanceSignedClient(db, config.Config{ActivityPub: config.ActivityPubConfig{ActorKeyEncryptionKey: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="}, Server: config.ServerConfig{PublicURL: "https://social.example"}}, base)
 
 	res, err := client.Get("https://remote.example/actor")
 	if err != nil {
@@ -100,7 +101,7 @@ func TestEnsureInstanceActorCreatesMissingServiceActor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	cfg := config.Config{Server: config.ServerConfig{PublicURL: "https://social.example"}, ActivityPub: config.ActivityPubConfig{Domain: "social.example"}}
+	cfg := config.Config{ActivityPub: config.ActivityPubConfig{ActorKeyEncryptionKey: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="}, Server: config.ServerConfig{PublicURL: "https://social.example"}}
 
 	mock.ExpectQuery("SELECT actor_uri, public_key_pem, private_key_pem_encrypted").
 		WithArgs("https://social.example/actor").
@@ -113,13 +114,13 @@ func TestEnsureInstanceActorCreatesMissingServiceActor(t *testing.T) {
 			"https://social.example/inbox", sqlmock.AnyArg(), sqlmock.AnyArg(),
 		).
 		WillReturnRows(sqlmock.NewRows([]string{"actor_uri", "public_key_pem", "private_key_pem_encrypted"}).
-			AddRow("https://social.example/actor", "public-key", "private-key"))
+			AddRow("https://social.example/actor", "public-key", encryptedInstanceTestKey(t, instanceTestPEM(t))))
 
 	actor, err := EnsureInstanceActor(context.Background(), db, cfg)
 	if err != nil {
 		t.Fatalf("EnsureInstanceActor returned error: %v", err)
 	}
-	if actor.ActorURI != "https://social.example/actor" || actor.PrivateKeyPEM != "private-key" {
+	if actor.ActorURI != "https://social.example/actor" || !strings.Contains(actor.PrivateKeyPEM, "PRIVATE KEY") {
 		t.Fatalf("actor = %+v", actor)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -133,11 +134,11 @@ func TestEnsureInstanceActorReturnsExistingActor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	cfg := config.Config{Server: config.ServerConfig{PublicURL: "https://social.example"}}
+	cfg := config.Config{ActivityPub: config.ActivityPubConfig{ActorKeyEncryptionKey: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="}, Server: config.ServerConfig{PublicURL: "https://social.example"}}
 	mock.ExpectQuery("SELECT actor_uri, public_key_pem, private_key_pem_encrypted").
 		WithArgs("https://social.example/actor").
 		WillReturnRows(sqlmock.NewRows([]string{"actor_uri", "public_key_pem", "private_key_pem_encrypted"}).
-			AddRow("https://social.example/actor", "public-key", "private-key"))
+			AddRow("https://social.example/actor", "public-key", encryptedInstanceTestKey(t, instanceTestPEM(t))))
 
 	actor, err := EnsureInstanceActor(context.Background(), db, cfg)
 	if err != nil {
@@ -149,4 +150,21 @@ func TestEnsureInstanceActorReturnsExistingActor(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func instanceTestPEM(t *testing.T) string {
+	t.Helper()
+	pair, err := GenerateActorKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pair.PrivateKeyPEM
+}
+func encryptedInstanceTestKey(t *testing.T, value string) string {
+	t.Helper()
+	encrypted, err := actorcrypto.Encrypt("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", "https://social.example/actor", value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encrypted
 }

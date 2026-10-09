@@ -1,6 +1,7 @@
 package delivery
 
 import (
+	"basisvr-social-service/internal/actorcrypto"
 	"bytes"
 	"context"
 	"database/sql"
@@ -31,9 +32,10 @@ type Job struct {
 }
 
 type Worker struct {
-	db          *sql.DB
-	client      *http.Client
-	maxAttempts int
+	db                    *sql.DB
+	client                *http.Client
+	maxAttempts           int
+	actorKeyEncryptionKey string
 }
 
 const blockedDomainExistsSQL = `
@@ -43,7 +45,7 @@ SELECT EXISTS (
   WHERE domain = $1 AND severity IN ('suspend', 'reject_all')
 )`
 
-func NewWorker(db *sql.DB, client *http.Client, maxAttempts int) Worker {
+func NewWorker(db *sql.DB, client *http.Client, maxAttempts int, actorKeyEncryptionKey string) Worker {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
@@ -56,7 +58,7 @@ func NewWorker(db *sql.DB, client *http.Client, maxAttempts int) Worker {
 	if maxAttempts <= 0 {
 		maxAttempts = 6
 	}
-	return Worker{db: db, client: &clientCopy, maxAttempts: maxAttempts}
+	return Worker{actorKeyEncryptionKey: actorKeyEncryptionKey, db: db, client: &clientCopy, maxAttempts: maxAttempts}
 }
 
 func (w Worker) DeliverDueOne(ctx context.Context) (bool, error) {
@@ -93,6 +95,10 @@ func (w Worker) DeliverDueOne(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 
+	job.PrivateKeyPEM, err = actorcrypto.Decrypt(w.actorKeyEncryptionKey, job.ActorURI, job.PrivateKeyPEM)
+	if err != nil {
+		return false, err
+	} // Keep the queued job intact for an operator to repair configuration/migrate keys.
 	req, err := NewSignedActivityRequest(ctx, job.TargetInboxURL, job.ActorURI, job.PrivateKeyPEM, job.RawJSON)
 	if err != nil {
 		if updateErr := markFailedOrRetry(ctx, tx, job, w.maxAttempts, err); updateErr != nil {

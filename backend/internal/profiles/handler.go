@@ -46,10 +46,13 @@ type publicProfileResponse struct {
 }
 
 type relationshipView struct {
-	Following  bool `json:"following"`
-	FollowedBy bool `json:"followedBy"`
-	Friend     bool `json:"friend"`
-	Blocked    bool `json:"blocked"`
+	Self            bool   `json:"self"`
+	FriendState     string `json:"friendState"`
+	FriendDirection string `json:"friendDirection"`
+	Following       bool   `json:"following"`
+	FollowedBy      bool   `json:"followedBy"`
+	Friend          bool   `json:"friend"`
+	Blocked         bool   `json:"blocked"`
 }
 
 type updateProfileRequest struct {
@@ -63,6 +66,7 @@ type updateProfileRequest struct {
 }
 
 func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	username := strings.ToLower(strings.TrimSpace(chi.URLParam(r, "username")))
 	if username == "" {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_username", "username is required")
@@ -78,10 +82,16 @@ func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusInternalServerError, "load_profile_failed", err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, profile)
+	profiles := []publicProfileResponse{profile}
+	if err := h.enrichRelationships(r.Context(), profiles); err != nil {
+		httpx.WriteError(w, 500, "load_relationships_failed", err.Error())
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, profiles[0])
 }
 
 func (h *Handler) SearchUsers(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	requestPage, err := page.ParseTextRequest(r, 24, 100)
 	if err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_pagination", err.Error())
@@ -136,6 +146,14 @@ LIMIT $4`, "%"+query+"%", cursorText, cursorID, requestPage.Limit+1)
 		nextCursor = page.NextTextCursor(page.TextCursor{SortText: strings.ToLower(last.Username), ID: last.ID})
 		results = results[:requestPage.Limit]
 	}
+	if err := rows.Close(); err != nil {
+		httpx.WriteError(w, 500, "search_failed", err.Error())
+		return
+	}
+	if err := h.enrichRelationships(r.Context(), results); err != nil {
+		httpx.WriteError(w, 500, "load_relationships_failed", err.Error())
+		return
+	}
 	httpx.WriteJSON(w, http.StatusOK, page.Response[publicProfileResponse]{
 		Data: results, Pagination: page.Metadata{NextCursor: nextCursor, Limit: requestPage.Limit},
 	})
@@ -165,7 +183,31 @@ func (h *Handler) UpdateMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := h.db.ExecContext(r.Context(), `
+	// Serialize profile changes with identity linking, which owns these canonical fields.
+	tx, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		httpx.WriteError(w, 500, "update_profile_failed", "Unable to update profile.")
+		return
+	}
+	defer tx.Rollback()
+	var userID string
+	if err = tx.QueryRowContext(r.Context(), `SELECT id FROM users WHERE id=$1 FOR UPDATE`, principal.UserID).Scan(&userID); err != nil {
+		httpx.WriteError(w, 500, "update_profile_failed", "Unable to update profile.")
+		return
+	}
+	if req.DisplayName != nil || req.AvatarURL != nil {
+		var managed bool
+		if err = tx.QueryRowContext(r.Context(), `SELECT EXISTS(SELECT 1 FROM beeba_identity_links WHERE user_id=$1)`, principal.UserID).Scan(&managed); err != nil {
+			httpx.WriteError(w, 500, "update_profile_failed", "Unable to update profile.")
+			return
+		}
+		if managed {
+			httpx.WriteError(w, 409, "managed_identity", "Change your display name and avatar in BeeBa.")
+			return
+		}
+	}
+
+	if _, err := tx.ExecContext(r.Context(), `
 UPDATE profiles
 SET
   display_name = COALESCE($2, display_name),
@@ -186,6 +228,11 @@ WHERE user_id = $1`,
 		privacy,
 	); err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "update_profile_failed", err.Error())
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		httpx.WriteError(w, 500, "update_profile_failed", "Unable to update profile.")
 		return
 	}
 
@@ -229,6 +276,7 @@ func scanPublicProfile(row scanner) (publicProfileResponse, error) {
 		return publicProfileResponse{}, err
 	}
 	profile.Links = dbx.DecodeJSON(linksRaw, []any{})
+	profile.Relationship.FriendState = "none"
 	return profile, nil
 }
 
@@ -244,4 +292,82 @@ func validateRawJSON(raw *json.RawMessage, fallback []byte) (any, error) {
 		return nil, err
 	}
 	return []byte(*raw), nil
+}
+
+// Enrich only the displayed bounded page with one query. Do not issue a query per
+// profile, and do not infer relationship state from public profile data.
+func (h *Handler) enrichRelationships(ctx context.Context, profiles []publicProfileResponse) error {
+	principal, authenticated := auth.PrincipalFromContext(ctx)
+	ids := make([]string, 0, len(profiles))
+	byActor := make(map[uuid.UUID]int, len(profiles))
+	for i := range profiles {
+		profiles[i].Relationship = relationshipView{FriendState: "none"}
+		if !authenticated {
+			continue
+		}
+		if profiles[i].ActorID == principal.ActorID {
+			profiles[i].Relationship.Self = true
+			continue
+		}
+		ids = append(ids, profiles[i].ActorID.String())
+		byActor[profiles[i].ActorID] = i
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	rows, err := h.db.QueryContext(ctx, `SELECT CASE WHEN actor_id=$1 THEN target_actor_id ELSE actor_id END,type,direction,state,actor_id=$1 FROM relationships WHERE ((actor_id=$1 AND target_actor_id=ANY($2::uuid[])) OR (target_actor_id=$1 AND actor_id=ANY($2::uuid[]))) AND state IN ('accepted','pending')`, principal.ActorID, dbx.PostgresTextArray(ids))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var actorID uuid.UUID
+		var kind, direction, state string
+		var outgoingRow bool
+		if err := rows.Scan(&actorID, &kind, &direction, &state, &outgoingRow); err != nil {
+			return err
+		}
+		index, ok := byActor[actorID]
+		if !ok {
+			continue
+		}
+		view := &profiles[index].Relationship
+		if !outgoingRow {
+			if direction == "outgoing" {
+				direction = "incoming"
+			} else if direction == "incoming" {
+				direction = "outgoing"
+			}
+		}
+		switch kind {
+		case "block":
+			view.Blocked = state == "accepted" || view.Blocked
+		case "friend":
+			if state == "accepted" {
+				view.Friend = true
+				view.FriendState = "accepted"
+				view.FriendDirection = "mutual"
+			} else if !view.Friend {
+				view.FriendState = "pending"
+				view.FriendDirection = direction
+			}
+		case "follow":
+			if state == "accepted" {
+				if direction == "outgoing" {
+					view.Following = true
+				} else if direction == "incoming" {
+					view.FollowedBy = true
+				}
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i := range profiles {
+		if profiles[i].Relationship.Blocked {
+			profiles[i].Relationship = relationshipView{FriendState: "none", Blocked: true}
+		}
+	}
+	return nil
 }

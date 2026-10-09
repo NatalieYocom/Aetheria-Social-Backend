@@ -71,7 +71,7 @@ func (h *Handler) CatalogStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	client, err := h.clientFactory.NewClient(catalog)
 	if err != nil {
-		httpx.WriteError(w, http.StatusBadGateway, "catalog_status_failed", err.Error())
+		httpx.WriteError(w, http.StatusBadGateway, "catalog_status_failed", "Could not check catalog availability.")
 		return
 	}
 	checker, ok := client.(CatalogHealthChecker)
@@ -91,39 +91,45 @@ func (h *Handler) CatalogStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 type resolveAssetRequest struct {
-	Catalog    string `json:"catalog"`
-	ExternalID string `json:"externalId"`
+	Catalog     string `json:"catalog"`
+	ExternalID  string `json:"externalId"`
+	IncludeNSFW bool   `json:"includeNsfw"`
 }
 
 type attachWorldAssetRequest struct {
-	AssetRefID uuid.UUID      `json:"assetRefId"`
-	Catalog    string         `json:"catalog"`
-	ExternalID string         `json:"externalId"`
-	Role       string         `json:"role"`
-	SortOrder  int            `json:"sortOrder"`
-	Metadata   map[string]any `json:"metadata"`
+	AssetRefID  uuid.UUID      `json:"assetRefId"`
+	Catalog     string         `json:"catalog"`
+	ExternalID  string         `json:"externalId"`
+	IncludeNSFW bool           `json:"includeNsfw"`
+	Role        string         `json:"role"`
+	SortOrder   int            `json:"sortOrder"`
+	Metadata    map[string]any `json:"metadata"`
 }
 
 func (h *Handler) ListCatalogs(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Enabled {
 		if _, err := h.ensureConfiguredCatalog(r.Context()); err != nil {
-			httpx.WriteError(w, http.StatusInternalServerError, "catalog_config_failed", err.Error())
+			httpx.WriteError(w, http.StatusInternalServerError, "catalog_config_failed", "Could not load catalog configuration.")
 			return
 		}
 	}
 	catalogs, err := h.repo.listCatalogs(r.Context())
 	if err != nil {
-		httpx.WriteError(w, http.StatusInternalServerError, "list_catalogs_failed", err.Error())
+		httpx.WriteError(w, http.StatusInternalServerError, "list_catalogs_failed", "Could not list catalogs.")
 		return
 	}
 	response := make([]CatalogResponse, 0, len(catalogs))
 	for _, catalog := range catalogs {
-		response = append(response, catalogResponse(catalog))
+		catalog = h.effectiveCatalog(catalog)
+		if catalog.Enabled {
+			response = append(response, catalogResponse(catalog))
+		}
 	}
 	httpx.WriteJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) ResolveAsset(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	if _, err := auth.RequirePrincipal(r.Context()); err != nil {
 		httpx.WriteError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
 		return
@@ -135,7 +141,7 @@ func (h *Handler) ResolveAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ref, err := h.resolveAssetRef(r.Context(), req.Catalog, req.ExternalID)
+	ref, err := h.resolveAssetRef(r.Context(), req.Catalog, req.ExternalID, req.IncludeNSFW)
 	if err != nil {
 		writeResolveError(w, err)
 		return
@@ -144,6 +150,7 @@ func (h *Handler) ResolveAsset(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) SearchAssets(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	catalog, err := h.loadCatalog(r.Context(), r.URL.Query().Get("catalog"))
 	if err != nil {
 		writeCatalogError(w, err, "catalog_search_failed")
@@ -155,7 +162,7 @@ func (h *Handler) SearchAssets(w http.ResponseWriter, r *http.Request) {
 	}
 	client, err := h.clientFactory.NewClient(catalog)
 	if err != nil {
-		httpx.WriteError(w, http.StatusBadGateway, "catalog_search_failed", err.Error())
+		httpx.WriteError(w, http.StatusBadGateway, "catalog_search_failed", "Could not search the catalog.")
 		return
 	}
 	page, err := client.SearchAssets(r.Context(), parseSearchQuery(r))
@@ -177,7 +184,7 @@ func (h *Handler) ListWorldAssets(w http.ResponseWriter, r *http.Request) {
 			writeWorldNotFound(w)
 			return
 		}
-		httpx.WriteError(w, http.StatusInternalServerError, "world_access_check_failed", err.Error())
+		httpx.WriteError(w, http.StatusInternalServerError, "world_access_check_failed", "Could not check world access.")
 		return
 	}
 	if !allowed {
@@ -186,7 +193,12 @@ func (h *Handler) ListWorldAssets(w http.ResponseWriter, r *http.Request) {
 	}
 	assets, err := h.repo.listWorldAssets(r.Context(), worldID)
 	if err != nil {
-		httpx.WriteError(w, http.StatusInternalServerError, "list_world_assets_failed", err.Error())
+		httpx.WriteError(w, http.StatusInternalServerError, "list_world_assets_failed", "Could not list world assets.")
+		return
+	}
+	assets, err = h.revalidateWorldAssets(r.Context(), assets, parseSearchQuery(r).IncludeNSFW)
+	if err != nil {
+		writeCatalogError(w, err, "catalog_unavailable")
 		return
 	}
 	writeWorldAssets(w, assets)
@@ -212,17 +224,21 @@ func (h *Handler) AttachWorldAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	assetID := req.AssetRefID
-	if assetID == uuid.Nil {
-		ref, err := h.resolveAssetRef(r.Context(), req.Catalog, req.ExternalID)
+	if req.AssetRefID != uuid.Nil {
+		var err error
+		req.Catalog, req.ExternalID, err = h.repo.assetIdentity(r.Context(), req.AssetRefID)
 		if err != nil {
-			writeResolveError(w, err)
+			if errors.Is(err, sql.ErrNoRows) {
+				writeCatalogError(w, errNotFound("asset not found"), "")
+			} else {
+				writeCatalogError(w, err, "catalog_unavailable")
+			}
 			return
 		}
-		assetID = ref.ID
 	}
-	if assetID == uuid.Nil {
-		httpx.WriteError(w, http.StatusBadRequest, "invalid_asset", "assetRefId or externalId is required")
+	ref, err := h.resolveAssetRef(r.Context(), req.Catalog, req.ExternalID, req.IncludeNSFW)
+	if err != nil {
+		writeResolveError(w, err)
 		return
 	}
 
@@ -231,13 +247,22 @@ func (h *Handler) AttachWorldAsset(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_role", "role must be primary, dependency, preview, spawn or environment")
 		return
 	}
-	if err := h.repo.attachWorldAsset(r.Context(), worldID, assetID, role, req.SortOrder, req.Metadata); err != nil {
-		httpx.WriteError(w, http.StatusInternalServerError, "attach_world_asset_failed", err.Error())
+	if role == WorldAssetRolePrimary && ref.Asset.ContentType != AssetTypeWorld {
+		httpx.WriteError(w, 400, "invalid_asset_type", "primary asset must be a world")
+		return
+	}
+	if err := h.repo.attachWorldAsset(r.Context(), worldID, principal.ActorID, ref, role, req.SortOrder, req.Metadata); err != nil {
+		writeCatalogError(w, err, "attach_world_asset_failed")
 		return
 	}
 	assets, err := h.repo.listWorldAssets(r.Context(), worldID)
 	if err != nil {
-		httpx.WriteError(w, http.StatusInternalServerError, "list_world_assets_failed", err.Error())
+		httpx.WriteError(w, http.StatusInternalServerError, "list_world_assets_failed", "Could not list world assets.")
+		return
+	}
+	assets, err = h.revalidateWorldAssets(r.Context(), assets, req.IncludeNSFW)
+	if err != nil {
+		writeCatalogError(w, err, "catalog_unavailable")
 		return
 	}
 	writeWorldAssets(w, assets)
@@ -261,13 +286,13 @@ func (h *Handler) DetachWorldAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.repo.detachWorldAsset(r.Context(), worldID, assetID); err != nil {
-		httpx.WriteError(w, http.StatusInternalServerError, "detach_world_asset_failed", err.Error())
+		httpx.WriteError(w, http.StatusInternalServerError, "detach_world_asset_failed", "Could not detach the world asset.")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (h *Handler) resolveAssetRef(ctx context.Context, catalogCode string, externalID string) (AssetRef, error) {
+func (h *Handler) resolveAssetRef(ctx context.Context, catalogCode string, externalID string, includeNSFW bool) (AssetRef, error) {
 	externalID = strings.TrimSpace(externalID)
 	if externalID == "" {
 		return AssetRef{}, errBadRequest("externalId is required")
@@ -283,7 +308,17 @@ func (h *Handler) resolveAssetRef(ctx context.Context, catalogCode string, exter
 	if err != nil {
 		return AssetRef{}, err
 	}
-	asset, err := client.ResolveAsset(ctx, externalID)
+	var asset ResolvedAsset
+	if batch, ok := client.(SnapshotClient); ok {
+		var current map[string]ResolvedAsset
+		current, err = batch.Snapshots(ctx, []string{externalID}, includeNSFW)
+		asset = current[externalID]
+		if err == nil && asset.Availability != "available" {
+			err = ErrAssetNotFound
+		}
+	} else {
+		asset, err = client.ResolveAsset(ctx, externalID)
+	}
 	if err != nil {
 		return AssetRef{}, err
 	}
@@ -301,7 +336,7 @@ func (h *Handler) loadCatalog(ctx context.Context, code string) (Catalog, error)
 
 	catalog, err := h.repo.catalogByCode(ctx, code)
 	if err == nil {
-		return catalog, nil
+		return h.effectiveCatalog(catalog), nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Catalog{}, err
@@ -339,7 +374,7 @@ func (h *Handler) requireWorldOwner(w http.ResponseWriter, ctx context.Context, 
 			httpx.WriteError(w, http.StatusNotFound, "not_found", "world not found")
 			return false
 		}
-		httpx.WriteError(w, http.StatusInternalServerError, "load_world_failed", err.Error())
+		httpx.WriteError(w, http.StatusInternalServerError, "load_world_failed", "Could not load the world.")
 		return false
 	}
 	if ownerID != actorID {
@@ -459,6 +494,7 @@ func parseUUIDParam(w http.ResponseWriter, r *http.Request, name string) (uuid.U
 }
 
 func writeWorldAssets(w http.ResponseWriter, assets []WorldAsset) {
+	w.Header().Set("Cache-Control", "no-store")
 	response := make([]WorldAssetResponse, 0, len(assets))
 	for _, asset := range assets {
 		response = append(response, worldAssetResponse(asset))
@@ -498,5 +534,5 @@ func writeCatalogError(w http.ResponseWriter, err error, fallbackCode string) {
 		httpx.WriteError(w, http.StatusNotFound, "not_found", err.Error())
 		return
 	}
-	httpx.WriteError(w, http.StatusBadGateway, fallbackCode, err.Error())
+	httpx.WriteError(w, http.StatusServiceUnavailable, "catalog_unavailable", "asset catalog is temporarily unavailable")
 }

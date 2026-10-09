@@ -46,6 +46,7 @@ func RegisterRoutes(r chi.Router, h *Handler, authMiddleware func(http.Handler) 
 		r.Delete("/api/instances/{id}", h.Delete)
 		r.Get("/api/admin/world-server-credentials", h.ListWorldServerCredentials)
 		r.Post("/api/admin/world-server-credentials", h.CreateWorldServerCredential)
+		r.Put("/api/admin/instances/{id}/world-server", h.BindWorldServer)
 		r.Delete("/api/admin/world-server-credentials/{credentialId}", h.RevokeWorldServerCredential)
 		r.Get("/api/admin/instance-join-audit", h.ListInstanceJoinAudit)
 	})
@@ -356,6 +357,15 @@ func (h *Handler) Join(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusInternalServerError, "join_instance_failed", err.Error())
 		return
 	}
+	var managed bool
+	if err := tx.QueryRowContext(r.Context(), `SELECT world_server_credential_id IS NOT NULL FROM instances WHERE id=$1`, id).Scan(&managed); err != nil {
+		httpx.WriteError(w, 500, "join_instance_failed", err.Error())
+		return
+	}
+	if managed {
+		httpx.WriteError(w, 409, "join_ticket_required", "join through the world server with a ticket")
+		return
+	}
 	if !target.active() {
 		httpx.WriteError(w, http.StatusConflict, "instance_not_active", "instance is not active")
 		return
@@ -492,6 +502,16 @@ func (h *Handler) Heartbeat(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusInternalServerError, "heartbeat_failed", err.Error())
 		return
 	}
+	var managed bool
+	if err := tx.QueryRowContext(r.Context(), `SELECT world_server_credential_id IS NOT NULL FROM instances WHERE id=$1`, id).Scan(&managed); err != nil {
+		httpx.WriteError(w, 500, "heartbeat_failed", err.Error())
+		return
+	}
+	if managed {
+		httpx.WriteError(w, 409, "world_server_required", "member heartbeat must come from the world server")
+		return
+	}
+
 	if instanceStatus != "active" || (expiresAt.Valid && !expiresAt.Time.After(time.Now().UTC())) {
 		httpx.WriteError(w, http.StatusConflict, "instance_not_active", "instance is not active")
 		return
@@ -977,8 +997,26 @@ func (h *Handler) isJoinedTx(ctx context.Context, tx *sql.Tx, instanceID uuid.UU
 }
 
 func (h *Handler) canJoin(ctx context.Context, tx *sql.Tx, target joinTarget, actorID uuid.UUID) (bool, error) {
+	var ownerID uuid.UUID
+	var visibility string
+	err := tx.QueryRowContext(ctx, `SELECT w.owner_actor_id,w.visibility FROM worlds w JOIN actors a ON a.id=w.owner_actor_id LEFT JOIN users u ON u.id=a.local_user_id WHERE w.id=$1 AND (a.local_user_id IS NULL OR u.status='active')`, target.worldID).Scan(&ownerID, &visibility)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	allowed, err := privacy.CanView(ctx, tx, privacy.ViewInput{OwnerActorID: ownerID, ViewerActorID: uuid.NullUUID{UUID: actorID, Valid: true}, Visibility: visibility})
+	if err != nil || !allowed {
+		return false, err
+	}
+
 	if actorID == target.hostActorID {
 		return true, nil
+	}
+	blocked, err := privacy.HasBlock(ctx, tx, actorID, target.hostActorID)
+	if err != nil || blocked {
+		return false, err
 	}
 	switch target.visibility {
 	case "public":

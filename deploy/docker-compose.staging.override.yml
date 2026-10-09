@@ -1,0 +1,80 @@
+services:
+  postgres:
+    image: postgres:16.10-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: basis_social
+      POSTGRES_USER: basis_social
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U basis_social -d basis_social"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command:
+      - /bin/sh
+      - -ec
+      - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$$(cat /run/secrets/redis_password)"
+    secrets: [redis_password]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$(cat /run/secrets/redis_password)\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  migrate:
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    environment:
+      ASSET_CATALOG_ENABLED: "true"
+      ASSET_CATALOG_CODE: beeba
+      ASSET_CATALOG_NAME: BeeBa Asset Catalog
+      ASSET_CATALOG_KIND: beeba
+      ASSET_CATALOG_BASE_URL: https://beeba.org
+      ASSET_CATALOG_API_BASE_URL: https://beeba.org/api/v1
+      ASSET_CATALOG_TIMEOUT: 5s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  delivery:
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  retention:
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+secrets:
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_SECRET_FILE:?Set POSTGRES_PASSWORD_SECRET_FILE}
+  redis_password:
+    file: ${REDIS_PASSWORD_SECRET_FILE:?Set REDIS_PASSWORD_SECRET_FILE}
+
+volumes:
+  postgres_data:
+  redis_data:

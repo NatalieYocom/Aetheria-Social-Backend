@@ -49,7 +49,7 @@ func TestPublishPresenceChangedFansOutToSelfAndFriends(t *testing.T) {
 	}
 }
 
-func TestPublishPresenceChangedDoesNotFanOutPrivatePresenceToFriends(t *testing.T) {
+func TestPublishPrivatePresenceRemovesPreviouslyVisibleFriendLocation(t *testing.T) {
 	db, mock := newMockDB(t)
 	broker := NewBroker(BrokerConfig{BufferSize: 4})
 	actorID := uuid.New()
@@ -65,12 +65,13 @@ func TestPublishPresenceChangedDoesNotFanOutPrivatePresenceToFriends(t *testing.
 		WillReturnRows(sqlmock.NewRows(presenceRealtimeColumns()).
 			AddRow(presenceID, actorID, "alice@example.social", "Alice", nil, nil, "online", "nobody", false, time.Now().UTC().Add(time.Minute), time.Now().UTC()))
 
+	mock.ExpectQuery(regexp.QuoteMeta(presenceFriendWatchersSQL)).WithArgs(actorID).WillReturnRows(sqlmock.NewRows([]string{"actor_id"}).AddRow(friendID))
 	if err := PublishPresenceChanged(context.Background(), db, broker, actorID); err != nil {
 		t.Fatalf("PublishPresenceChanged: %v", err)
 	}
 
 	assertEventType(t, selfEvents, "presence.updated")
-	assertNoEvent(t, friendEvents)
+	assertEventType(t, friendEvents, "presence.removed")
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}

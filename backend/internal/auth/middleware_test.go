@@ -47,7 +47,7 @@ func TestOptionalMiddlewareAttachesPrincipalWhenBearerTokenIsValid(t *testing.T)
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
-	mock.ExpectQuery("SELECT EXISTS").WithArgs(userID, actorID, int64(0)).
+	mock.ExpectQuery("SELECT EXISTS").WithArgs(userID, actorID, int64(0), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 	handler := OptionalMiddleware(manager, db)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		principal, ok := PrincipalFromContext(r.Context())
@@ -82,7 +82,7 @@ func TestMiddlewareRejectsTokenWhenUserIsSuspended(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mock.ExpectQuery("SELECT EXISTS").WithArgs(userID, actorID, int64(0)).
+	mock.ExpectQuery("SELECT EXISTS").WithArgs(userID, actorID, int64(0), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 
 	handler := Middleware(manager, db)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -110,7 +110,7 @@ func TestMiddlewareAcceptsWebSocketBearerSubprotocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mock.ExpectQuery("SELECT EXISTS").WithArgs(userID, actorID, int64(0)).
+	mock.ExpectQuery("SELECT EXISTS").WithArgs(userID, actorID, int64(0), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 	handler := Middleware(manager, db)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)

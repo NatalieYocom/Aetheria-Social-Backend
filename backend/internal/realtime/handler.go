@@ -1,7 +1,9 @@
 package realtime
 
 import (
+	"basisvr-social-service/internal/privacy"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,9 +22,12 @@ import (
 )
 
 type Handler struct {
-	broker         *Broker
-	originPatterns []string
-	replayLimit    int
+	privacyDB            *sql.DB
+	broker               *Broker
+	originPatterns       []string
+	replayLimit          int
+	sessionValidator     auth.SessionValidator
+	sessionCheckInterval time.Duration
 }
 
 func NewHandler(broker *Broker, allowedOrigins ...string) *Handler {
@@ -37,6 +42,32 @@ func NewHandler(broker *Broker, allowedOrigins ...string) *Handler {
 		}
 	}
 	return &Handler{broker: broker, originPatterns: patterns, replayLimit: 500}
+}
+
+// SetSessionValidator bounds active streams after logout/revocation and dependency outages.
+func (h *Handler) SetSessionValidator(validate auth.SessionValidator) *Handler {
+	h.sessionValidator = validate
+	h.sessionCheckInterval = 5 * time.Second
+	return h
+}
+func (h *Handler) sessionChecks(ctx context.Context, p auth.Principal) (<-chan time.Time, func(), func() bool) {
+	if h.sessionValidator == nil {
+		return nil, func() {}, func() bool { return true }
+	}
+	interval := h.sessionCheckInterval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	return ticker.C, ticker.Stop, func() bool {
+		if !time.Now().Before(p.ExpiresAt) {
+			return false
+		}
+		checkCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		defer cancel()
+		valid, err := h.sessionValidator(checkCtx, p)
+		return err == nil && valid
+	}
 }
 
 func (h *Handler) SetReplayLimit(limit int) *Handler {
@@ -95,7 +126,7 @@ func (h *Handler) WebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			for _, event := range result.Events {
-				if err := writeWebSocketEvent(ctx, conn, event); err != nil {
+				if err := writeWebSocketEvent(ctx, conn, h.privateEvent(ctx, principal.ActorID, event)); err != nil {
 					return
 				}
 				lastCursor = event.Cursor
@@ -103,12 +134,28 @@ func (h *Handler) WebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	sessionTick, stopSessionChecks, validSession := h.sessionChecks(ctx, principal)
+	defer stopSessionChecks()
+	expiryDelay := time.Until(principal.ExpiresAt)
+	if principal.ExpiresAt.IsZero() {
+		expiryDelay = 24 * time.Hour
+	}
+	expiry := time.NewTimer(max(time.Duration(0), expiryDelay))
+	defer expiry.Stop()
 	keepalive := time.NewTicker(25 * time.Second)
 	defer keepalive.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-expiry.C:
+			_ = conn.Close(websocket.StatusPolicyViolation, "session expired")
+			return
+		case <-sessionTick:
+			if !validSession() {
+				_ = conn.Close(websocket.StatusPolicyViolation, "session no longer active")
+				return
+			}
 		case event, ok := <-events:
 			if !ok {
 				return
@@ -116,7 +163,7 @@ func (h *Handler) WebSocket(w http.ResponseWriter, r *http.Request) {
 			if replayedOrOlder(event.Cursor, lastCursor) {
 				continue
 			}
-			if err := writeWebSocketEvent(ctx, conn, event); err != nil {
+			if err := writeWebSocketEvent(ctx, conn, h.privateEvent(ctx, principal.ActorID, event)); err != nil {
 				return
 			}
 			lastCursor = event.Cursor
@@ -152,40 +199,59 @@ func (h *Handler) Events(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_replay_cursor", "realtime replay cursor is invalid")
 		return
 	}
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		httpx.WriteError(w, http.StatusInternalServerError, "streaming_unsupported", "response writer does not support streaming")
-		return
-	}
-
+	// Logging/metrics wrap ResponseWriter and expose Unwrap rather than Flusher.
+	// ResponseController follows that chain to the actual HTTP transport.
+	controller := http.NewResponseController(w)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
+	if err := controller.Flush(); err != nil {
+		if errors.Is(err, http.ErrNotSupported) {
+			w.Header().Del("Connection")
+			w.Header().Del("X-Accel-Buffering")
+			httpx.WriteError(w, http.StatusInternalServerError, "streaming_unsupported", "response writer does not support streaming")
+		}
+		return
+	}
 
 	events, unsubscribe := h.broker.Subscribe(r.Context(), principal.ActorID)
 	defer unsubscribe()
 
-	writeSSE(w, flusher, Event{
+	if err := writeSSE(w, controller, Event{
 		Type:    "realtime.connected",
 		ActorID: principal.ActorID,
 		Payload: map[string]any{
 			"username": principal.Username,
 		},
-	})
+	}); err != nil {
+		return
+	}
 	lastCursor := cursor
 	if cursor != "" {
 		result, replayErr := h.broker.Replay(r.Context(), principal.ActorID, cursor, h.replayLimit)
 		if replayErr != nil || result.Truncated {
-			writeSSE(w, flusher, resyncRequiredEvent(principal.ActorID, replayErr, result.Truncated))
+			if err := writeSSE(w, controller, resyncRequiredEvent(principal.ActorID, replayErr, result.Truncated)); err != nil {
+				return
+			}
 		} else {
 			for _, event := range result.Events {
-				writeSSE(w, flusher, event)
+				if err := writeSSE(w, controller, h.privateEvent(r.Context(), principal.ActorID, event)); err != nil {
+					return
+				}
 				lastCursor = event.Cursor
 			}
 		}
 	}
 
+	sessionTick, stopSessionChecks, validSession := h.sessionChecks(r.Context(), principal)
+	defer stopSessionChecks()
+	expiryDelay := time.Until(principal.ExpiresAt)
+	if principal.ExpiresAt.IsZero() {
+		expiryDelay = 24 * time.Hour
+	}
+	expiry := time.NewTimer(max(time.Duration(0), expiryDelay))
+	defer expiry.Stop()
 	keepalive := time.NewTicker(25 * time.Second)
 	defer keepalive.Stop()
 
@@ -193,6 +259,12 @@ func (h *Handler) Events(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-expiry.C:
+			return
+		case <-sessionTick:
+			if !validSession() {
+				return
+			}
 		case event, ok := <-events:
 			if !ok {
 				return
@@ -200,19 +272,25 @@ func (h *Handler) Events(w http.ResponseWriter, r *http.Request) {
 			if replayedOrOlder(event.Cursor, lastCursor) {
 				continue
 			}
-			writeSSE(w, flusher, event)
+			if err := writeSSE(w, controller, h.privateEvent(r.Context(), principal.ActorID, event)); err != nil {
+				return
+			}
 			lastCursor = event.Cursor
 			if event.Type == "user.suspended" {
 				return
 			}
 		case <-keepalive.C:
-			_, _ = w.Write([]byte(": keepalive\n\n"))
-			flusher.Flush()
+			if _, err := w.Write([]byte(": keepalive\n\n")); err != nil {
+				return
+			}
+			if err := controller.Flush(); err != nil {
+				return
+			}
 		}
 	}
 }
 
-func writeSSE(w http.ResponseWriter, flusher http.Flusher, event Event) {
+func writeSSE(w http.ResponseWriter, controller *http.ResponseController, event Event) error {
 	if event.ID == "" {
 		event.ID = fmt.Sprintf("%d", time.Now().UTC().UnixNano())
 	}
@@ -221,16 +299,19 @@ func writeSSE(w http.ResponseWriter, flusher http.Flusher, event Event) {
 	}
 	data, err := json.Marshal(event)
 	if err != nil {
-		return
+		return err
 	}
 	eventType := strings.ReplaceAll(event.Type, "\n", "")
 	cursor := strings.ReplaceAll(event.Cursor, "\n", "")
 	if cursor != "" {
-		_, _ = fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", cursor, eventType, data)
+		_, err = fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", cursor, eventType, data)
 	} else {
-		_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, data)
+		_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, data)
 	}
-	flusher.Flush()
+	if err != nil {
+		return err
+	}
+	return controller.Flush()
 }
 
 func resyncRequiredEvent(actorID uuid.UUID, replayErr error, truncated bool) Event {
@@ -247,4 +328,38 @@ func resyncRequiredEvent(actorID uuid.UUID, replayErr error, truncated bool) Eve
 
 func replayedOrOlder(cursor, lastCursor string) bool {
 	return validReplayCursor(cursor) && validReplayCursor(lastCursor) && compareStreamIDs(cursor, lastCursor) <= 0
+}
+
+func (h *Handler) SetPrivacyDB(db *sql.DB) *Handler { h.privacyDB = db; return h }
+func (h *Handler) privateEvent(ctx context.Context, viewer uuid.UUID, event Event) Event {
+	if h.privacyDB == nil || event.ActorID == uuid.Nil {
+		return event
+	}
+	if event.Type == "presence.updated" {
+		payload, err := loadPresenceForRealtime(ctx, h.privacyDB, event.ActorID)
+		allowed := err == nil && payload.ExpiresAt.After(time.Now())
+		if allowed && viewer != event.ActorID {
+			var friend bool
+			err = h.privacyDB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM relationships WHERE actor_id=$1 AND target_actor_id=$2 AND type='friend' AND state='accepted')`, viewer, event.ActorID).Scan(&friend)
+			blocked, blockErr := privacy.HasBlock(ctx, h.privacyDB, viewer, event.ActorID)
+			allowed = err == nil && blockErr == nil && friend && !blocked && payload.visibleToFriends()
+			payload = payload.publicView()
+		}
+		if allowed {
+			event.Payload = payload
+		} else {
+			event.Type = "presence.removed"
+			event.Payload = map[string]string{"actorId": event.ActorID.String()}
+		}
+		return event
+	}
+	if viewer != event.ActorID && event.Type != "presence.removed" {
+		blocked, err := privacy.HasBlock(ctx, h.privacyDB, viewer, event.ActorID)
+		if blocked || err != nil {
+			event.Type = "realtime.resync_required"
+			event.ActorID = viewer
+			event.Payload = map[string]string{"reason": "privacy_changed"}
+		}
+	}
+	return event
 }

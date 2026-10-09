@@ -70,11 +70,19 @@ services:
       RATE_LIMIT_ENABLED: "true"
       RATE_LIMIT_REQUESTS: 600
       RATE_LIMIT_WINDOW: 1m
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
+      AUTH_RATE_LIMIT_REQUESTS: ${AUTH_RATE_LIMIT_REQUESTS:-20}
       CORS_ALLOWED_ORIGINS: ""
       METRICS_ENABLED: "true"
       JSON_LOGS_ENABLED: "true"
       READINESS_TIMEOUT: 2s
       JWT_SECRET: dev-secret-change-me
+      ACTOR_KEY_ENCRYPTION_KEY: ${ACTOR_KEY_ENCRYPTION_KEY:?Set a persistent base64 32-byte actor wrapping key}
+      BEEBA_IDENTITY_ENABLED: ${BEEBA_IDENTITY_ENABLED:-false}
+      BEEBA_IDENTITY_API_URL: ${BEEBA_IDENTITY_API_URL:-}
+      BEEBA_IDENTITY_PUBLIC_URL: ${BEEBA_IDENTITY_PUBLIC_URL:-}
+      BEEBA_IDENTITY_SECRET: ${BEEBA_IDENTITY_SECRET:-}
+      BEEBA_IDENTITY_TIMEOUT: ${BEEBA_IDENTITY_TIMEOUT:-3s}
       REGISTRATION_ENABLED: "true"
       FEDERATION_MODE: disabled
       ACTIVITYPUB_ENABLED: "false"
@@ -105,6 +113,7 @@ services:
       DATABASE_URL: postgres://basis:basis@postgres:5432/basis_social?sslmode=disable
       ACTIVITYPUB_FETCH_TIMEOUT: 10s
       ACTIVITYPUB_MAX_DELIVERY_ATTEMPTS: 6
+      ACTOR_KEY_ENCRYPTION_KEY: ${ACTOR_KEY_ENCRYPTION_KEY:?Set a persistent base64 32-byte actor wrapping key}
     command: ["/app/delivery"]
     depends_on:
       postgres:

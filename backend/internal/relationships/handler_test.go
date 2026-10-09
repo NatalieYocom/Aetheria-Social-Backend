@@ -61,6 +61,10 @@ func TestFriendRequestCreatesDurableNotification(t *testing.T) {
 	defer unsubscribe()
 
 	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT id FROM actors.*ORDER BY id FOR UPDATE").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(testPrincipal.ActorID).AddRow(targetID))
+	mock.ExpectQuery("SELECT EXISTS.*type = 'block'").WillReturnRows(sqlmock.NewRows([]string{"blocked"}).AddRow(false))
+
+	mock.ExpectQuery("SELECT state,direction FROM relationships").WillReturnError(sql.ErrNoRows)
 	mock.ExpectExec("INSERT INTO relationships").
 		WithArgs(testPrincipal.ActorID, targetID, "friend", "outgoing", "pending").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -94,6 +98,9 @@ func TestFriendAcceptRequiresIncomingPendingRequest(t *testing.T) {
 	targetID := uuid.New()
 
 	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT id FROM actors.*ORDER BY id FOR UPDATE").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(testPrincipal.ActorID).AddRow(targetID))
+	mock.ExpectQuery("SELECT EXISTS.*type = 'block'").WillReturnRows(sqlmock.NewRows([]string{"blocked"}).AddRow(false))
+
 	mock.ExpectExec("actor_id = \\$1 AND target_actor_id = \\$2 AND direction = 'incoming'").
 		WithArgs(testPrincipal.ActorID, targetID, "accepted").
 		WillReturnResult(sqlmock.NewResult(0, 0))

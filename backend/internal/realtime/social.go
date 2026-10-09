@@ -19,10 +19,11 @@ WHERE ps.actor_id = $1`
 
 const presenceFriendWatchersSQL = `
 SELECT actor_id
-FROM relationships
+FROM relationships rel
 WHERE target_actor_id = $1
   AND type = 'friend'
-  AND state = 'accepted'`
+  AND state = 'accepted'
+ AND NOT EXISTS(SELECT 1 FROM relationships b WHERE b.type='block' AND b.state='accepted' AND ((b.actor_id=$1 AND b.target_actor_id=rel.actor_id) OR (b.actor_id=rel.actor_id AND b.target_actor_id=$1)))`
 
 const instanceWatchersSQL = `
 SELECT host_actor_id AS actor_id
@@ -62,9 +63,6 @@ func PublishPresenceChanged(ctx context.Context, db *sql.DB, broker *Broker, act
 		Payload: payload,
 	})
 
-	if !payload.visibleToFriends() {
-		return nil
-	}
 	watchers, err := loadPresenceFriendWatchers(ctx, db, actorID)
 	if err != nil {
 		return err
@@ -74,11 +72,11 @@ func PublishPresenceChanged(ctx context.Context, db *sql.DB, broker *Broker, act
 		if watcherID == actorID {
 			continue
 		}
-		broker.Publish(watcherID, Event{
-			Type:    "presence.updated",
-			ActorID: actorID,
-			Payload: friendPayload,
-		})
+		if payload.visibleToFriends() {
+			broker.Publish(watcherID, Event{Type: "presence.updated", ActorID: actorID, Payload: friendPayload})
+		} else {
+			broker.Publish(watcherID, Event{Type: "presence.removed", ActorID: actorID, Payload: map[string]string{"actorId": actorID.String()}})
+		}
 	}
 	return nil
 }

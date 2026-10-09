@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"basisvr-social-service/internal/activitypub/delivery"
+	"basisvr-social-service/internal/actorcrypto"
 	"basisvr-social-service/internal/config"
 	"basisvr-social-service/internal/database"
 	"basisvr-social-service/internal/observability"
@@ -17,6 +18,9 @@ import (
 
 func main() {
 	cfg := config.Load()
+	if _, err := actorcrypto.New(cfg.ActivityPub.ActorKeyEncryptionKey); err != nil {
+		log.Fatal(err)
+	}
 	if cfg.Observability.TracingService == "basisvr-social-api" {
 		cfg.Observability.TracingService = "basisvr-social-delivery"
 	}
@@ -43,6 +47,7 @@ func main() {
 		db,
 		&http.Client{Timeout: cfg.ActivityPub.FetchTimeout},
 		cfg.ActivityPub.MaxDeliveryAttempts,
+		cfg.ActivityPub.ActorKeyEncryptionKey,
 	)
 
 	stop := make(chan os.Signal, 1)

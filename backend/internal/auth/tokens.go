@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 const (
@@ -22,6 +23,7 @@ type TokenSubject struct {
 type TokenClaims struct {
 	Subject   TokenSubject `json:"subject"`
 	TokenType string       `json:"tokenType"`
+	SessionID string       `json:"sid"`
 	jwt.RegisteredClaims
 }
 
@@ -48,21 +50,25 @@ func NewTokenManager(secret string, accessTTL, refreshTTL time.Duration) TokenMa
 }
 
 func (m TokenManager) Issue(subject TokenSubject) (TokenPair, error) {
-	access, err := m.sign(subject, TokenTypeAccess, m.accessTTL)
+	return m.IssueSession(subject, uuid.NewString(), time.Now().UTC().Add(m.refreshTTL))
+}
+
+func (m TokenManager) IssueSession(subject TokenSubject, sessionID string, absoluteExpiry time.Time) (TokenPair, error) {
+	now := time.Now().UTC()
+	refreshTTL := min(m.refreshTTL, absoluteExpiry.Sub(now))
+	accessTTL := min(m.accessTTL, refreshTTL)
+	if accessTTL < time.Second {
+		return TokenPair{}, errors.New("session expired")
+	}
+	access, err := m.sign(subject, sessionID, TokenTypeAccess, accessTTL)
 	if err != nil {
 		return TokenPair{}, err
 	}
-	refresh, err := m.sign(subject, TokenTypeRefresh, m.refreshTTL)
+	refresh, err := m.sign(subject, sessionID, TokenTypeRefresh, refreshTTL)
 	if err != nil {
 		return TokenPair{}, err
 	}
-	return TokenPair{
-		AccessToken:           access,
-		RefreshToken:          refresh,
-		TokenType:             "Bearer",
-		AccessTokenExpiresIn:  int64(m.accessTTL.Seconds()),
-		RefreshTokenExpiresIn: int64(m.refreshTTL.Seconds()),
-	}, nil
+	return TokenPair{AccessToken: access, RefreshToken: refresh, TokenType: "Bearer", AccessTokenExpiresIn: int64(accessTTL.Seconds()), RefreshTokenExpiresIn: int64(refreshTTL.Seconds())}, nil
 }
 
 func (m TokenManager) VerifyAccess(rawToken string) (*TokenClaims, error) {
@@ -73,13 +79,15 @@ func (m TokenManager) VerifyRefresh(rawToken string) (*TokenClaims, error) {
 	return m.verifyTyped(rawToken, TokenTypeRefresh)
 }
 
-func (m TokenManager) sign(subject TokenSubject, tokenType string, ttl time.Duration) (string, error) {
+func (m TokenManager) sign(subject TokenSubject, sessionID, tokenType string, ttl time.Duration) (string, error) {
 	now := time.Now().UTC()
 	claims := TokenClaims{
 		Subject:   subject,
 		TokenType: tokenType,
+		SessionID: sessionID,
 		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   subject.UserID,
+			Subject: subject.UserID,
+			Issuer:  "basis-social", Audience: jwt.ClaimStrings{"basis-social-api"}, ID: uuid.NewString(),
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
 		},
@@ -95,7 +103,7 @@ func (m TokenManager) verifyTyped(rawToken string, expectedType string) (*TokenC
 			return nil, errors.New("unexpected signing method")
 		}
 		return m.secret, nil
-	})
+	}, jwt.WithExpirationRequired(), jwt.WithIssuer("basis-social"), jwt.WithAudience("basis-social-api"), jwt.WithIssuedAt())
 	if err != nil {
 		return nil, err
 	}
@@ -104,6 +112,15 @@ func (m TokenManager) verifyTyped(rawToken string, expectedType string) (*TokenC
 	}
 	if claims.TokenType != expectedType {
 		return nil, errors.New("unexpected token type")
+	}
+	if _, err := uuid.Parse(claims.SessionID); err != nil {
+		return nil, errors.New("session required; sign in again")
+	}
+	if _, err := uuid.Parse(claims.ID); err != nil {
+		return nil, errors.New("token id required")
+	}
+	if claims.RegisteredClaims.Subject != claims.Subject.UserID {
+		return nil, errors.New("invalid subject")
 	}
 	return claims, nil
 }

@@ -12,9 +12,10 @@ import (
 )
 
 type FixedWindowConfig struct {
-	Limit  int
-	Window time.Duration
-	Now    func() time.Time
+	Limit   int
+	Window  time.Duration
+	Now     func() time.Time
+	MaxKeys int
 }
 
 type FixedWindowLimiter struct {
@@ -23,6 +24,8 @@ type FixedWindowLimiter struct {
 	window  time.Duration
 	now     func() time.Time
 	buckets map[string]rateBucket
+	maxKeys int
+	sweptAt time.Time
 }
 
 type rateBucket struct {
@@ -43,7 +46,12 @@ func NewFixedWindowLimiter(config FixedWindowConfig) *FixedWindowLimiter {
 	if now == nil {
 		now = time.Now
 	}
+	maxKeys := config.MaxKeys
+	if maxKeys <= 0 {
+		maxKeys = 10000
+	}
 	return &FixedWindowLimiter{
+		maxKeys: maxKeys,
 		limit:   limit,
 		window:  window,
 		now:     now,
@@ -142,7 +150,18 @@ func (l *FixedWindowLimiter) Allow(key string) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	bucket := l.buckets[key]
+	if l.sweptAt.IsZero() || now.Sub(l.sweptAt) >= l.window {
+		for stored, bucket := range l.buckets {
+			if now.Sub(bucket.start) >= l.window {
+				delete(l.buckets, stored)
+			}
+		}
+		l.sweptAt = now
+	}
+	bucket, exists := l.buckets[key]
+	if !exists && len(l.buckets) >= l.maxKeys {
+		return false, l.window
+	}
 	if bucket.start.IsZero() || now.Sub(bucket.start) >= l.window {
 		l.buckets[key] = rateBucket{start: now, count: 1}
 		return true, 0
@@ -160,17 +179,6 @@ func (l *FixedWindowLimiter) Allow(key string) (bool, time.Duration) {
 }
 
 func clientKey(r *http.Request) string {
-	forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
-	if forwarded != "" {
-		host := strings.TrimSpace(strings.Split(forwarded, ",")[0])
-		if host != "" {
-			return host
-		}
-	}
-	realIP := strings.TrimSpace(r.Header.Get("X-Real-IP"))
-	if realIP != "" {
-		return realIP
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil && host != "" {
 		return host

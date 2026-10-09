@@ -65,6 +65,9 @@ func TestServiceMemberHeartbeatRefreshesMembershipAndPresence(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(claimRuntimeInstanceSQL)).
 		WithArgs(instanceID, credentialID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(regexp.QuoteMeta(joinInstanceSelectSQL)).WithArgs(instanceID).WillReturnRows(joinInstanceRows().AddRow(instanceID, worldID, uuid.New(), "public", 16, 1, "active", time.Now().Add(time.Minute)))
+	mock.ExpectQuery("SELECT w.owner_actor_id,w.visibility").WillReturnRows(sqlmock.NewRows([]string{"owner", "visibility"}).AddRow(uuid.New(), "public"))
+	mock.ExpectQuery("SELECT EXISTS.*type = 'block'").WillReturnRows(sqlmock.NewRows([]string{"blocked"}).AddRow(false))
 	mock.ExpectExec("UPDATE instance_members").
 		WithArgs(instanceID, actorID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))

@@ -36,6 +36,13 @@ type Catalog struct {
 }
 
 type ResolvedAsset struct {
+	VersionID      string `json:"versionId"`
+	SHA256         string `json:"sha256"`
+	SizeBytes      int64  `json:"sizeBytes"`
+	UnlockPassword string `json:"unlockPassword"`
+	Availability   string `json:"availability"`
+	Revision       string `json:"revision"`
+
 	ExternalID  string
 	ExternalURL string
 	ContentType string
@@ -74,6 +81,8 @@ type AssetRef struct {
 }
 
 type WorldAsset struct {
+	PinnedVersionID string
+
 	Asset     AssetRef
 	Role      string
 	SortOrder int
@@ -92,6 +101,13 @@ type CatalogResponse struct {
 }
 
 type AssetRefResponse struct {
+	VersionID      string `json:"versionId"`
+	SHA256         string `json:"sha256"`
+	SizeBytes      int64  `json:"sizeBytes"`
+	UnlockPassword string `json:"unlockPassword"`
+	Availability   string `json:"availability"`
+	Revision       string `json:"revision"`
+
 	ID          uuid.UUID       `json:"id"`
 	Catalog     CatalogResponse `json:"catalog"`
 	ExternalID  string          `json:"externalId"`
@@ -116,6 +132,13 @@ type WorldAssetResponse struct {
 }
 
 type SearchItemResponse struct {
+	VersionID      string `json:"versionId"`
+	SHA256         string `json:"sha256"`
+	SizeBytes      int64  `json:"sizeBytes"`
+	UnlockPassword string `json:"unlockPassword"`
+	Availability   string `json:"availability"`
+	Revision       string `json:"revision"`
+
 	ExternalID  string         `json:"externalId"`
 	ExternalURL string         `json:"externalUrl"`
 	ContentType string         `json:"contentType"`
@@ -149,7 +172,7 @@ func catalogResponse(catalog Catalog) CatalogResponse {
 		Name:       catalog.Name,
 		Kind:       catalog.Kind,
 		BaseURL:    catalog.BaseURL,
-		APIBaseURL: catalog.APIBaseURL,
+		APIBaseURL: joinURL(catalog.BaseURL, "api/v1"),
 		Enabled:    catalog.Enabled,
 		Metadata:   nonNilMap(catalog.Metadata),
 	}
@@ -157,20 +180,26 @@ func catalogResponse(catalog Catalog) CatalogResponse {
 
 func assetRefResponse(ref AssetRef) AssetRefResponse {
 	return AssetRefResponse{
-		ID:          ref.ID,
-		Catalog:     catalogResponse(ref.Catalog),
-		ExternalID:  ref.Asset.ExternalID,
-		ExternalURL: ref.Asset.ExternalURL,
-		ContentType: ref.Asset.ContentType,
-		Title:       ref.Asset.Title,
-		Description: ref.Asset.Description,
-		PreviewURL:  ref.Asset.PreviewURL,
-		DownloadURL: ref.Asset.DownloadURL,
-		AuthorName:  ref.Asset.AuthorName,
-		License:     ref.Asset.License,
-		NSFW:        ref.Asset.NSFW,
-		Tags:        nonNilStrings(ref.Asset.Tags),
-		Metadata:    nonNilMap(ref.Asset.Metadata),
+		ID:             ref.ID,
+		Catalog:        catalogResponse(ref.Catalog),
+		VersionID:      ref.Asset.VersionID,
+		SHA256:         ref.Asset.SHA256,
+		SizeBytes:      ref.Asset.SizeBytes,
+		UnlockPassword: ref.Asset.UnlockPassword,
+		Availability:   ref.Asset.Availability,
+		Revision:       ref.Asset.Revision,
+		ExternalID:     ref.Asset.ExternalID,
+		ExternalURL:    ref.Asset.ExternalURL,
+		ContentType:    ref.Asset.ContentType,
+		Title:          ref.Asset.Title,
+		Description:    ref.Asset.Description,
+		PreviewURL:     ref.Asset.PreviewURL,
+		DownloadURL:    ref.Asset.DownloadURL,
+		AuthorName:     ref.Asset.AuthorName,
+		License:        ref.Asset.License,
+		NSFW:           ref.Asset.NSFW,
+		Tags:           nonNilStrings(ref.Asset.Tags),
+		Metadata:       nonNilMap(ref.Asset.Metadata),
 	}
 }
 
@@ -197,18 +226,24 @@ func searchResponse(catalog Catalog, page SearchPage) SearchResponse {
 
 func searchItemResponse(asset ResolvedAsset) SearchItemResponse {
 	return SearchItemResponse{
-		ExternalID:  asset.ExternalID,
-		ExternalURL: asset.ExternalURL,
-		ContentType: asset.ContentType,
-		Title:       asset.Title,
-		Description: asset.Description,
-		PreviewURL:  asset.PreviewURL,
-		DownloadURL: asset.DownloadURL,
-		AuthorName:  asset.AuthorName,
-		License:     asset.License,
-		NSFW:        asset.NSFW,
-		Tags:        nonNilStrings(asset.Tags),
-		Metadata:    nonNilMap(asset.Metadata),
+		VersionID:      asset.VersionID,
+		SHA256:         asset.SHA256,
+		SizeBytes:      asset.SizeBytes,
+		UnlockPassword: asset.UnlockPassword,
+		Availability:   asset.Availability,
+		Revision:       asset.Revision,
+		ExternalID:     asset.ExternalID,
+		ExternalURL:    asset.ExternalURL,
+		ContentType:    asset.ContentType,
+		Title:          asset.Title,
+		Description:    asset.Description,
+		PreviewURL:     asset.PreviewURL,
+		DownloadURL:    asset.DownloadURL,
+		AuthorName:     asset.AuthorName,
+		License:        asset.License,
+		NSFW:           asset.NSFW,
+		Tags:           nonNilStrings(asset.Tags),
+		Metadata:       nonNilMap(asset.Metadata),
 	}
 }
 

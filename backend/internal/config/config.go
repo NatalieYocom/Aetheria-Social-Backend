@@ -3,14 +3,18 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"basisvr-social-service/internal/actorcrypto"
 )
 
 type Config struct {
+	BeeBa         BeeBaConfig
 	Environment   string
 	Server        ServerConfig
 	Database      DatabaseConfig
@@ -78,6 +82,7 @@ type AuthConfig struct {
 }
 
 type ActivityPubConfig struct {
+	ActorKeyEncryptionKey  string
 	Enabled                bool
 	Domain                 string
 	AuthorizedFetch        string
@@ -109,13 +114,16 @@ type AssetCatalogConfig struct {
 }
 
 type SecurityConfig struct {
-	RegistrationEnabled bool
-	FederationMode      string
-	MaxRequestBodyBytes int64
-	RateLimitEnabled    bool
-	RateLimitRequests   int
-	RateLimitWindow     time.Duration
-	CORSAllowedOrigins  []string
+	RegistrationEnabled   bool
+	FederationMode        string
+	MaxRequestBodyBytes   int64
+	RateLimitEnabled      bool
+	RateLimitRequests     int
+	RateLimitWindow       time.Duration
+	CORSAllowedOrigins    []string
+	TrustedProxyCIDRs     []string
+	AuthRateLimitRequests int
+	RateLimitMaxKeys      int
 }
 
 func Load() Config {
@@ -124,6 +132,7 @@ func Load() Config {
 	redisURL := getSecretEnv("REDIS_URL", "")
 
 	return Config{
+		BeeBa:       loadBeeBa(),
 		Environment: getEnv("APP_ENV", "development"),
 		Server: ServerConfig{
 			Bind:              getEnv("API_BIND", "0.0.0.0:8080"),
@@ -171,6 +180,7 @@ func Load() Config {
 			RefreshTokenTTL: getDurationEnv("REFRESH_TOKEN_TTL", 30*24*time.Hour),
 		},
 		ActivityPub: ActivityPubConfig{
+			ActorKeyEncryptionKey:  loadActorEncryptionKey(),
 			Enabled:                getBoolEnv("ACTIVITYPUB_ENABLED", false),
 			Domain:                 domain,
 			AuthorizedFetch:        strings.ToLower(getEnv("ACTIVITYPUB_AUTHORIZED_FETCH", "protected")),
@@ -199,22 +209,40 @@ func Load() Config {
 			Timeout:    getDurationEnv("ASSET_CATALOG_TIMEOUT", 5*time.Second),
 		},
 		Security: SecurityConfig{
-			RegistrationEnabled: getBoolEnv("REGISTRATION_ENABLED", true),
-			FederationMode:      getEnv("FEDERATION_MODE", "disabled"),
-			MaxRequestBodyBytes: getInt64Env("MAX_REQUEST_BODY_BYTES", 8*1024*1024),
-			RateLimitEnabled:    getBoolEnv("RATE_LIMIT_ENABLED", true),
-			RateLimitRequests:   getIntEnv("RATE_LIMIT_REQUESTS", 600),
-			RateLimitWindow:     getDurationEnv("RATE_LIMIT_WINDOW", time.Minute),
-			CORSAllowedOrigins:  getCSVEnv("CORS_ALLOWED_ORIGINS"),
+			RegistrationEnabled:   getBoolEnv("REGISTRATION_ENABLED", true),
+			FederationMode:        getEnv("FEDERATION_MODE", "disabled"),
+			MaxRequestBodyBytes:   getInt64Env("MAX_REQUEST_BODY_BYTES", 8*1024*1024),
+			RateLimitEnabled:      getBoolEnv("RATE_LIMIT_ENABLED", true),
+			RateLimitRequests:     getIntEnv("RATE_LIMIT_REQUESTS", 600),
+			RateLimitWindow:       getDurationEnv("RATE_LIMIT_WINDOW", time.Minute),
+			CORSAllowedOrigins:    getCSVEnv("CORS_ALLOWED_ORIGINS"),
+			TrustedProxyCIDRs:     getCSVEnv("TRUSTED_PROXY_CIDRS"),
+			AuthRateLimitRequests: getIntEnv("AUTH_RATE_LIMIT_REQUESTS", 20),
+			RateLimitMaxKeys:      getIntEnv("RATE_LIMIT_MAX_KEYS", 10000),
 		},
 	}
 }
 
 func (c Config) Validate() error {
+	if err := c.AssetCatalog.Validate(c.Environment); err != nil {
+		return err
+	}
+	for _, cidr := range c.Security.TrustedProxyCIDRs {
+		if _, err := netip.ParsePrefix(cidr); err != nil {
+			return errors.New("TRUSTED_PROXY_CIDRS must contain valid CIDRs")
+		}
+	}
+	if err := c.BeeBa.Validate(c.Environment); err != nil {
+		return err
+	}
+	_, actorKeyError := actorcrypto.New(c.ActivityPub.ActorKeyEncryptionKey)
 	if strings.ToLower(strings.TrimSpace(c.Environment)) != "production" {
-		return nil
+		return actorKeyError
 	}
 	var problems []error
+	if actorKeyError != nil {
+		problems = append(problems, actorKeyError)
+	}
 	publicURL, err := url.Parse(c.Server.PublicURL)
 	if err != nil || publicURL.Scheme != "https" || publicURL.Hostname() == "" {
 		problems = append(problems, errors.New("PUBLIC_URL must be an absolute HTTPS URL in production"))

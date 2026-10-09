@@ -14,6 +14,7 @@ import (
 
 	"basisvr-social-service/internal/activitypub/legacysig"
 	"basisvr-social-service/internal/activitypub/messagesig"
+	"basisvr-social-service/internal/actorcrypto"
 	"basisvr-social-service/internal/config"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
@@ -49,7 +50,7 @@ func (t *instanceSigningTransport) RoundTrip(req *http.Request) (*http.Response,
 		return nil, fmt.Errorf("instance signing transport only supports GET and HEAD, got %s", req.Method)
 	}
 	actorURI := strings.TrimRight(t.cfg.Server.PublicURL, "/") + "/actor"
-	actor, err := loadInstanceActor(req.Context(), t.db, actorURI)
+	actor, err := loadInstanceActor(req.Context(), t.db, actorURI, t.cfg.ActivityPub.ActorKeyEncryptionKey)
 	if err != nil {
 		return nil, fmt.Errorf("load instance actor: %w", err)
 	}
@@ -97,7 +98,7 @@ func parseInstancePrivateKey(value string) (*rsa.PrivateKey, error) {
 func EnsureInstanceActor(ctx context.Context, db *sql.DB, cfg config.Config) (InstanceActor, error) {
 	baseURL := strings.TrimRight(cfg.Server.PublicURL, "/")
 	actorURI := baseURL + "/actor"
-	actor, err := loadInstanceActor(ctx, db, actorURI)
+	actor, err := loadInstanceActor(ctx, db, actorURI, cfg.ActivityPub.ActorKeyEncryptionKey)
 	if err == nil {
 		return actor, nil
 	}
@@ -108,6 +109,10 @@ func EnsureInstanceActor(ctx context.Context, db *sql.DB, cfg config.Config) (In
 	keyPair, err := GenerateActorKeyPair()
 	if err != nil {
 		return InstanceActor{}, fmt.Errorf("generate instance actor key: %w", err)
+	}
+	encrypted, err := actorcrypto.Encrypt(cfg.ActivityPub.ActorKeyEncryptionKey, actorURI, keyPair.PrivateKeyPEM)
+	if err != nil {
+		return InstanceActor{}, err
 	}
 	domain := strings.TrimSpace(cfg.ActivityPub.Domain)
 	if domain == "" {
@@ -124,20 +129,31 @@ ON CONFLICT (actor_uri) DO UPDATE SET actor_uri = EXCLUDED.actor_uri
 RETURNING actor_uri, public_key_pem, private_key_pem_encrypted`,
 		actorURI, "instance@"+domain, domain,
 		actorURI+"/inbox", actorURI+"/outbox", actorURI+"/followers", actorURI+"/following",
-		baseURL+"/inbox", keyPair.PublicKeyPEM, keyPair.PrivateKeyPEM,
+		baseURL+"/inbox", keyPair.PublicKeyPEM, encrypted,
 	).Scan(&actor.ActorURI, &actor.PublicKeyPEM, &actor.PrivateKeyPEM)
 	if err != nil {
 		return InstanceActor{}, fmt.Errorf("create instance actor: %w", err)
 	}
+	actor.PrivateKeyPEM, err = actorcrypto.Decrypt(cfg.ActivityPub.ActorKeyEncryptionKey, actor.ActorURI, actor.PrivateKeyPEM)
+	if err != nil {
+		return InstanceActor{}, err
+	}
 	return actor, nil
 }
 
-func loadInstanceActor(ctx context.Context, db *sql.DB, actorURI string) (InstanceActor, error) {
+func loadInstanceActor(ctx context.Context, db *sql.DB, actorURI, encryptionKey string) (InstanceActor, error) {
 	var actor InstanceActor
 	err := db.QueryRowContext(ctx, `
 SELECT actor_uri, public_key_pem, private_key_pem_encrypted
 FROM actors
 WHERE actor_uri = $1 AND is_local = true AND type = 'Service'`, actorURI).
 		Scan(&actor.ActorURI, &actor.PublicKeyPEM, &actor.PrivateKeyPEM)
-	return actor, err
+	if err != nil {
+		return InstanceActor{}, err
+	}
+	actor.PrivateKeyPEM, err = actorcrypto.Decrypt(encryptionKey, actor.ActorURI, actor.PrivateKeyPEM)
+	if err != nil {
+		return InstanceActor{}, err
+	}
+	return actor, nil
 }

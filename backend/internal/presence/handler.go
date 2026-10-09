@@ -11,6 +11,7 @@ import (
 	"basisvr-social-service/internal/auth"
 	"basisvr-social-service/internal/common/dbx"
 	"basisvr-social-service/internal/common/httpx"
+	"basisvr-social-service/internal/common/page"
 	"basisvr-social-service/internal/realtime"
 
 	"github.com/go-chi/chi/v5"
@@ -82,8 +83,17 @@ func (h *Handler) Upsert(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_visibility", "visibility must be nobody, friends, followers or public")
 		return
 	}
-	expiresAt := time.Now().UTC().Add(90 * time.Second)
+	if req.WorldID != nil || req.InstanceID != nil {
+		httpx.WriteError(w, 400, "server_managed_presence", "world and instance are managed by the world server")
+		return
+	}
+	now := time.Now().UTC()
+	expiresAt := now.Add(90 * time.Second)
 	if req.ExpiresAt != nil {
+		if !req.ExpiresAt.After(now) || req.ExpiresAt.After(expiresAt) {
+			httpx.WriteError(w, 400, "invalid_expiration", "presence expiresAt must be within the next 90 seconds")
+			return
+		}
 		expiresAt = *req.ExpiresAt
 	}
 
@@ -92,12 +102,12 @@ func (h *Handler) Upsert(w http.ResponseWriter, r *http.Request) {
 INSERT INTO presence_sessions (actor_id, world_id, instance_id, status, visibility, show_exact_instance, expires_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (actor_id)
-DO UPDATE SET world_id = EXCLUDED.world_id,
-              instance_id = EXCLUDED.instance_id,
+DO UPDATE SET world_id = presence_sessions.world_id,
+              instance_id = presence_sessions.instance_id,
               status = EXCLUDED.status,
               visibility = EXCLUDED.visibility,
               show_exact_instance = EXCLUDED.show_exact_instance,
-              expires_at = EXCLUDED.expires_at,
+              expires_at = CASE WHEN presence_sessions.instance_id IS NULL THEN EXCLUDED.expires_at ELSE presence_sessions.expires_at END,
               updated_at = now()
 RETURNING id`,
 		principal.ActorID,
@@ -128,7 +138,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
 		return
 	}
-	if _, err := h.db.ExecContext(r.Context(), `DELETE FROM presence_sessions WHERE actor_id = $1`, principal.ActorID); err != nil {
+	if _, err := h.db.ExecContext(r.Context(), `DELETE FROM presence_sessions WHERE actor_id = $1 AND instance_id IS NULL`, principal.ActorID); err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "delete_presence_failed", err.Error())
 		return
 	}
@@ -161,6 +171,18 @@ func (h *Handler) Friends(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	requestPage, err := page.ParseRequest(r, 50, 100)
+	if err != nil {
+		httpx.WriteError(w, 400, "invalid_pagination", err.Error())
+		return
+	}
+	var cursorTime any
+	cursorID := uuid.Nil
+	if requestPage.Cursor != nil {
+		cursorTime = requestPage.Cursor.SortTime
+		cursorID = requestPage.Cursor.ID
+	}
+
 	rows, err := h.db.QueryContext(r.Context(), `
 SELECT ps.id, ps.actor_id, a.acct, a.display_name, ps.world_id,
        CASE WHEN ps.show_exact_instance THEN ps.instance_id ELSE NULL END AS instance_id,
@@ -174,7 +196,10 @@ WHERE rel.actor_id = $1
   AND ps.visibility IN ('friends', 'public')
   AND ps.status <> 'invisible'
   AND ps.expires_at > now()
-ORDER BY ps.updated_at DESC`, principal.ActorID)
+  AND NOT EXISTS(SELECT 1 FROM relationships b WHERE b.type='block' AND b.state='accepted' AND ((b.actor_id=$1 AND b.target_actor_id=ps.actor_id) OR (b.actor_id=ps.actor_id AND b.target_actor_id=$1)))
+  AND EXISTS (SELECT 1 FROM users u WHERE u.id=a.local_user_id AND u.status='active')
+  AND ($2::timestamptz IS NULL OR (ps.updated_at,ps.id)<($2,$3))
+ORDER BY ps.updated_at DESC,ps.id DESC LIMIT $4`, principal.ActorID, cursorTime, cursorID, requestPage.Limit+1)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "list_presence_failed", err.Error())
 		return
@@ -194,7 +219,13 @@ ORDER BY ps.updated_at DESC`, principal.ActorID)
 		httpx.WriteError(w, http.StatusInternalServerError, "list_presence_failed", err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, items)
+	var nextCursor *string
+	if len(items) > requestPage.Limit {
+		last := items[requestPage.Limit-1]
+		nextCursor = page.NextCursor(page.Cursor{SortTime: last.UpdatedAt, ID: last.ID})
+		items = items[:requestPage.Limit]
+	}
+	httpx.WriteJSON(w, http.StatusOK, page.Response[PresenceResponse]{Data: items, Pagination: page.Metadata{NextCursor: nextCursor, Limit: requestPage.Limit}})
 }
 
 func (h *Handler) loadByActor(ctx context.Context, actorID uuid.UUID) (PresenceResponse, error) {

@@ -30,10 +30,9 @@ FOR UPDATE`
 
 const claimRuntimeInstanceSQL = `
 UPDATE instances
-SET world_server_credential_id = $2,
-    last_heartbeat_at = COALESCE(last_heartbeat_at, now())
+SET last_heartbeat_at = COALESCE(last_heartbeat_at, now())
 WHERE id = $1
-  AND (world_server_credential_id IS NULL OR world_server_credential_id = $2)`
+  AND world_server_credential_id = $2`
 
 const decrementRuntimeInstanceUsersSQL = `
 UPDATE instances
@@ -47,7 +46,7 @@ type serviceInstanceHeartbeatRequest struct {
 type serviceMemberHeartbeatRequest struct {
 	Status             string         `json:"status"`
 	PresenceVisibility string         `json:"presenceVisibility"`
-	ShowExactInstance  bool           `json:"showExactInstance"`
+	ShowExactInstance  *bool          `json:"showExactInstance"`
 	Metadata           map[string]any `json:"metadata"`
 }
 
@@ -176,6 +175,21 @@ func (h *Handler) ServiceMemberHeartbeat(w http.ResponseWriter, r *http.Request)
 		writeRuntimeAuthorizationError(w, err)
 		return
 	}
+	joinedTarget, err := h.loadJoinTarget(r.Context(), tx, instanceID)
+	if err != nil {
+		httpx.WriteError(w, 500, "member_heartbeat_failed", err.Error())
+		return
+	}
+	allowed, err := h.canJoin(r.Context(), tx, joinedTarget, actorID)
+	if err != nil {
+		httpx.WriteError(w, 500, "member_heartbeat_failed", err.Error())
+		return
+	}
+	if !allowed {
+		httpx.WriteError(w, 403, "join_denied", "actor can no longer join this instance")
+		return
+	}
+
 	result, err := tx.ExecContext(r.Context(), `
 UPDATE instance_members im
 SET last_seen_at = now(), metadata = $3
@@ -199,10 +213,10 @@ INSERT INTO presence_sessions (actor_id, world_id, instance_id, status, visibili
 VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (actor_id) DO UPDATE
 SET world_id = EXCLUDED.world_id, instance_id = EXCLUDED.instance_id,
-    status = EXCLUDED.status, visibility = EXCLUDED.visibility,
-    show_exact_instance = EXCLUDED.show_exact_instance,
+    status = presence_sessions.status, visibility = presence_sessions.visibility,
+    show_exact_instance = presence_sessions.show_exact_instance,
     expires_at = EXCLUDED.expires_at, updated_at = now()`,
-		actorID, target.worldID, instanceID, status, visibility, req.ShowExactInstance, expiresAt,
+		actorID, target.worldID, instanceID, status, visibility, req.ShowExactInstance != nil && *req.ShowExactInstance, expiresAt,
 	); err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "member_heartbeat_failed", err.Error())
 		return

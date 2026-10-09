@@ -34,6 +34,9 @@ type DefaultClientFactory struct {
 }
 
 func (f DefaultClientFactory) NewClient(catalog Catalog) (CatalogClient, error) {
+	if !validCatalogURL(catalog.BaseURL, false) || !validCatalogURL(catalog.APIBaseURL, true) {
+		return nil, ErrCatalogUnavailable
+	}
 	switch catalog.Kind {
 	case CatalogKindBeeBa:
 		return NewBeeBaClient(BeeBaClientConfig{
@@ -54,7 +57,6 @@ type BeeBaClientConfig struct {
 
 type BeeBaClient struct {
 	catalog Catalog
-	token   string
 	client  *http.Client
 }
 
@@ -65,14 +67,30 @@ func NewBeeBaClient(cfg BeeBaClientConfig) *BeeBaClient {
 	}
 	cfg.Catalog.BaseURL = strings.TrimRight(cfg.Catalog.BaseURL, "/")
 	cfg.Catalog.APIBaseURL = strings.TrimRight(cfg.Catalog.APIBaseURL, "/")
-	return &BeeBaClient{catalog: cfg.Catalog, token: cfg.APIToken, client: client}
+	safeClient := *client
+	safeClient.Jar = nil
+	safeClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	if safeClient.Timeout <= 0 || safeClient.Timeout > 10*time.Second {
+		safeClient.Timeout = 5 * time.Second
+	}
+	return &BeeBaClient{catalog: cfg.Catalog, client: &safeClient}
 }
 
 func (c *BeeBaClient) CheckHealth(ctx context.Context) error {
 	if c.catalog.BaseURL == "" {
 		return errors.New("beeba base url is not configured")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, joinURL(c.catalog.BaseURL, "readyz"), nil)
+	healthBase := c.catalog.BaseURL
+	if c.catalog.APIBaseURL != "" {
+		origin, err := url.Parse(c.catalog.APIBaseURL)
+		if err != nil {
+			return ErrCatalogUnavailable
+		}
+		origin.Path = ""
+		origin.RawPath = ""
+		healthBase = origin.String()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, joinURL(healthBase, "readyz"), nil)
 	if err != nil {
 		return err
 	}
@@ -99,75 +117,15 @@ func (c *BeeBaClient) CheckHealth(ctx context.Context) error {
 }
 
 func (c *BeeBaClient) ResolveAsset(ctx context.Context, externalID string) (ResolvedAsset, error) {
-	externalID = strings.TrimSpace(externalID)
-	if externalID == "" {
-		return ResolvedAsset{}, errors.New("external asset id is required")
-	}
-	if c.catalog.APIBaseURL == "" {
-		return ResolvedAsset{}, errors.New("beeba api base url is not configured")
-	}
-
-	detailURL := joinURL(c.catalog.APIBaseURL, "content", externalID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, detailURL, nil)
+	assets, err := c.Snapshots(ctx, []string{externalID}, false)
 	if err != nil {
 		return ResolvedAsset{}, err
 	}
-	req.Header.Set("Accept", "application/json")
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
-
-	res, err := c.client.Do(req)
-	if err != nil {
-		return ResolvedAsset{}, err
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode == http.StatusNotFound {
+	asset := assets[externalID]
+	if asset.Availability != "available" {
 		return ResolvedAsset{}, ErrAssetNotFound
 	}
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return ResolvedAsset{}, fmt.Errorf("catalog returned %s", res.Status)
-	}
-
-	var envelope beebaDetailEnvelope
-	if err := json.NewDecoder(res.Body).Decode(&envelope); err != nil {
-		return ResolvedAsset{}, err
-	}
-	if envelope.Data.ID == "" {
-		return ResolvedAsset{}, errors.New("catalog response is missing content id")
-	}
-
-	previewURL := c.previewURL(envelope.Data)
-	metadata := map[string]any{
-		"source":           CatalogKindBeeBa,
-		"slug":             envelope.Data.Slug,
-		"status":           envelope.Data.Status,
-		"visibility":       envelope.Data.Visibility,
-		"categorySlug":     envelope.Data.Category.Slug,
-		"categoryName":     envelope.Data.Category.Name,
-		"previewImageID":   envelope.Data.PreviewImageID,
-		"fileSize":         envelope.Data.File.FileSize,
-		"fileHashSHA256":   envelope.Data.File.FileHashSHA256,
-		"originalFilename": envelope.Data.File.OriginalFilename,
-	}
-	if envelope.Data.Author.DisplayName != "" {
-		metadata["authorDisplayName"] = envelope.Data.Author.DisplayName
-	}
-
-	return ResolvedAsset{
-		ExternalID:  envelope.Data.ID,
-		ExternalURL: joinURL(c.catalog.APIBaseURL, "content", envelope.Data.ID),
-		ContentType: beebaCategoryToAssetType(envelope.Data.Category.Slug),
-		Title:       envelope.Data.Title,
-		Description: envelope.Data.Description,
-		PreviewURL:  previewURL,
-		DownloadURL: joinURL(c.catalog.APIBaseURL, "content", envelope.Data.ID, "download"),
-		AuthorName:  envelope.Data.Author.Username,
-		NSFW:        envelope.Data.NSFW,
-		Tags:        beebaTagSlugs(envelope.Data.Tags),
-		Metadata:    metadata,
-	}, nil
+	return asset, nil
 }
 
 func (c *BeeBaClient) SearchAssets(ctx context.Context, query SearchQuery) (SearchPage, error) {
@@ -213,9 +171,6 @@ func (c *BeeBaClient) SearchAssets(ctx context.Context, query SearchQuery) (Sear
 		return SearchPage{}, err
 	}
 	req.Header.Set("Accept", "application/json")
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
 
 	res, err := c.client.Do(req)
 	if err != nil {
@@ -228,12 +183,20 @@ func (c *BeeBaClient) SearchAssets(ctx context.Context, query SearchQuery) (Sear
 	}
 
 	var envelope beebaSearchEnvelope
-	if err := json.NewDecoder(res.Body).Decode(&envelope); err != nil {
+	if err := decodeCatalogJSON(res.Body, &envelope); err != nil {
 		return SearchPage{}, err
 	}
 	items := make([]ResolvedAsset, 0, len(envelope.Data))
+	if len(envelope.Data) > 50 {
+		return SearchPage{}, ErrCatalogUnavailable
+	}
 	for _, item := range envelope.Data {
-		items = append(items, c.searchItem(item))
+		if !validID(item.ID) || item.Status != "published" || item.Visibility != "public" || (item.NSFW && !query.IncludeNSFW) {
+			continue
+		}
+		asset := c.searchItem(item)
+		asset.Availability = "available"
+		items = append(items, asset)
 	}
 	return SearchPage{
 		Items:      items,
@@ -241,27 +204,10 @@ func (c *BeeBaClient) SearchAssets(ctx context.Context, query SearchQuery) (Sear
 	}, nil
 }
 
-func (c *BeeBaClient) previewURL(item beebaContentDetail) string {
-	for _, image := range item.Gallery {
-		if image.IsPrimary && strings.TrimSpace(image.URL) != "" {
-			return absoluteURL(image.URL, c.catalog.BaseURL, c.catalog.APIBaseURL)
-		}
-	}
-	for _, image := range item.Gallery {
-		if strings.TrimSpace(image.URL) != "" {
-			return absoluteURL(image.URL, c.catalog.BaseURL, c.catalog.APIBaseURL)
-		}
-	}
-	if item.PreviewImageID != "" {
-		return joinURL(c.catalog.APIBaseURL, "media", item.PreviewImageID)
-	}
-	return ""
-}
-
 func (c *BeeBaClient) searchItem(item beebaContentSummary) ResolvedAsset {
 	previewURL := ""
-	if item.PreviewImageID != "" {
-		previewURL = joinURL(c.catalog.APIBaseURL, "media", item.PreviewImageID)
+	if validID(item.PreviewImageID) {
+		previewURL = joinURL(c.catalog.BaseURL, "api/v1/media", item.PreviewImageID)
 	}
 	metadata := map[string]any{
 		"source":         CatalogKindBeeBa,
@@ -280,21 +226,17 @@ func (c *BeeBaClient) searchItem(item beebaContentSummary) ResolvedAsset {
 	}
 	return ResolvedAsset{
 		ExternalID:  item.ID,
-		ExternalURL: joinURL(c.catalog.APIBaseURL, "content", item.ID),
+		ExternalURL: joinURL(c.catalog.BaseURL, "api/v1/content", item.ID),
 		ContentType: beebaCategoryToAssetType(item.Category.Slug),
 		Title:       item.Title,
 		Description: item.Description,
 		PreviewURL:  previewURL,
-		DownloadURL: joinURL(c.catalog.APIBaseURL, "content", item.ID, "download"),
+		DownloadURL: "",
 		AuthorName:  item.Author.Username,
 		NSFW:        item.NSFW,
 		Tags:        beebaTagSlugs(item.Tags),
 		Metadata:    metadata,
 	}
-}
-
-type beebaDetailEnvelope struct {
-	Data beebaContentDetail `json:"data"`
 }
 
 type beebaSearchEnvelope struct {
@@ -324,19 +266,19 @@ type beebaContentSummary struct {
 }
 
 type beebaContentDetail struct {
-	ID             string       `json:"id"`
-	Slug           string       `json:"slug"`
-	Title          string       `json:"title"`
-	Description    string       `json:"description"`
-	Status         string       `json:"status"`
-	Visibility     string       `json:"visibility"`
-	NSFW           bool         `json:"nsfw"`
-	Category       beebaTerm    `json:"category"`
-	Author         beebaAuthor  `json:"author"`
-	Tags           []beebaTerm  `json:"tags"`
-	PreviewImageID string       `json:"preview_image_id"`
-	Gallery        []beebaImage `json:"gallery"`
-	File           beebaFile    `json:"file"`
+	UnlockPassword string      `json:"unlock_password"`
+	ID             string      `json:"id"`
+	Slug           string      `json:"slug"`
+	Title          string      `json:"title"`
+	Description    string      `json:"description"`
+	Status         string      `json:"status"`
+	Visibility     string      `json:"visibility"`
+	NSFW           bool        `json:"nsfw"`
+	Category       beebaTerm   `json:"category"`
+	Author         beebaAuthor `json:"author"`
+	Tags           []beebaTerm `json:"tags"`
+	PreviewImageID string      `json:"preview_image_id"`
+	File           beebaFile   `json:"file"`
 }
 
 type beebaTerm struct {
@@ -349,12 +291,8 @@ type beebaAuthor struct {
 	DisplayName string `json:"display_name"`
 }
 
-type beebaImage struct {
-	URL       string `json:"url"`
-	IsPrimary bool   `json:"is_primary"`
-}
-
 type beebaFile struct {
+	ID               string `json:"id"`
 	FileSize         int64  `json:"file_size"`
 	FileHashSHA256   string `json:"file_hash_sha256"`
 	OriginalFilename string `json:"original_filename"`
@@ -425,28 +363,4 @@ func joinURL(base string, parts ...string) string {
 	}
 	parsed.Path = "/" + path.Join(segments...)
 	return parsed.String()
-}
-
-func absoluteURL(raw string, baseURL string, apiBaseURL string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	parsed, err := url.Parse(raw)
-	if err == nil && parsed.IsAbs() {
-		return parsed.String()
-	}
-	base := strings.TrimRight(baseURL, "/")
-	if base == "" {
-		base = strings.TrimRight(apiBaseURL, "/")
-	}
-	baseParsed, err := url.Parse(base)
-	if err != nil {
-		return raw
-	}
-	if strings.HasPrefix(raw, "/") {
-		return baseParsed.Scheme + "://" + baseParsed.Host + raw
-	}
-	baseParsed.Path = path.Join(baseParsed.Path, raw)
-	return baseParsed.String()
 }

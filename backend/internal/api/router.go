@@ -9,6 +9,7 @@ import (
 	"basisvr-social-service/internal/activitypub"
 	"basisvr-social-service/internal/assetcatalog"
 	"basisvr-social-service/internal/auth"
+	"basisvr-social-service/internal/community"
 	"basisvr-social-service/internal/config"
 	"basisvr-social-service/internal/events"
 	"basisvr-social-service/internal/groups"
@@ -43,7 +44,7 @@ func NewRouter(deps Deps) http.Handler {
 	r := chi.NewRouter()
 	r.Use(versionedAPI)
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	r.Use(security.TrustedProxy(deps.Config.Security.TrustedProxyCIDRs))
 	if deps.Config.Observability.TracingEnabled {
 		r.Use(otelhttp.NewMiddleware("basisvr.http", otelhttp.WithFilter(func(r *http.Request) bool {
 			return r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && r.URL.Path != "/metrics"
@@ -60,17 +61,20 @@ func NewRouter(deps Deps) http.Handler {
 	r.Use(security.BodyLimit(deps.Config.Security.MaxRequestBodyBytes))
 	if deps.Config.Security.RateLimitEnabled {
 		r.Use(security.RateLimit(security.NewFixedWindowLimiter(security.FixedWindowConfig{
-			Limit:  deps.Config.Security.RateLimitRequests,
-			Window: deps.Config.Security.RateLimitWindow,
+			Limit:   deps.Config.Security.RateLimitRequests,
+			Window:  deps.Config.Security.RateLimitWindow,
+			MaxKeys: deps.Config.Security.RateLimitMaxKeys,
 		})))
+		r.Use(security.AuthRateLimit(deps.Config.Security.AuthRateLimitRequests, deps.Config.Security.RateLimitMaxKeys))
 	}
 	tokens := auth.NewTokenManager(
 		deps.Config.Auth.JWTSecret,
 		deps.Config.Auth.AccessTokenTTL,
 		deps.Config.Auth.RefreshTokenTTL,
 	)
-	authMiddleware := auth.Middleware(tokens, deps.DB)
-	r.Use(auth.OptionalMiddleware(tokens, deps.DB))
+	linkedValidator := auth.LinkedIdentityValidator(deps.DB, deps.Config.BeeBa)
+	authMiddleware := auth.Middleware(tokens, deps.DB, linkedValidator)
+	r.Use(auth.OptionalMiddleware(tokens, deps.DB, linkedValidator))
 	var metrics *observability.Metrics
 	if deps.Config.Observability.MetricsEnabled {
 		metrics = observability.NewMetrics()
@@ -161,19 +165,26 @@ func NewRouter(deps Deps) http.Handler {
 		Checks:  readinessChecks,
 	}).ServeHTTP)
 
-	auth.RegisterRoutes(r, auth.NewHandler(deps.DB, deps.Config, tokens), authMiddleware)
+	authHandler := auth.NewHandler(deps.DB, deps.Config, tokens)
+	auth.RegisterRoutes(r, authHandler, authMiddleware)
+	auth.RegisterBeeBaRoutes(r, authHandler)
+	community.RegisterRoutes(r, deps.DB, deps.Config, realtimeBroker)
 	profiles.RegisterRoutes(r, profiles.NewHandler(deps.DB), authMiddleware)
 	relationships.RegisterRoutes(r, relationships.NewHandler(deps.DB, realtimeBroker), authMiddleware)
 	worlds.RegisterRoutes(r, worlds.NewHandler(deps.DB, deps.Config.Server.PublicURL), authMiddleware)
 	events.RegisterRoutes(r, events.NewHandler(deps.DB, deps.Config.Server.PublicURL), authMiddleware)
-	groups.RegisterRoutes(r, groups.NewHandler(deps.DB, deps.Config.Server.PublicURL, realtimeBroker), authMiddleware)
+	groups.RegisterRoutes(r, groups.NewHandler(deps.DB, deps.Config.Server.PublicURL, realtimeBroker, deps.Config.ActivityPub.ActorKeyEncryptionKey), authMiddleware)
 	instances.RegisterRoutes(r, instances.NewHandler(deps.DB, realtimeBroker), authMiddleware)
 	invites.RegisterRoutes(r, invites.NewHandler(deps.DB, realtimeBroker), authMiddleware)
 	moderation.RegisterRoutes(r, moderation.NewHandler(deps.DB, realtimeBroker), authMiddleware)
 	notifications.RegisterRoutes(r, notifications.NewHandler(deps.DB, realtimeBroker), authMiddleware)
 	presence.RegisterRoutes(r, presence.NewHandler(deps.DB, realtimeBroker), authMiddleware)
 	realtimeHandler := realtime.NewHandler(realtimeBroker, deps.Config.Security.CORSAllowedOrigins...).
-		SetReplayLimit(deps.Config.Realtime.ReplayLimit)
+		SetReplayLimit(deps.Config.Realtime.ReplayLimit).
+		SetPrivacyDB(deps.DB).
+		SetSessionValidator(func(ctx context.Context, p auth.Principal) (bool, error) {
+			return auth.PrincipalIsActive(ctx, deps.DB, p, linkedValidator)
+		})
 	realtime.RegisterRoutes(r, realtimeHandler, authMiddleware)
 	assetcatalog.RegisterRoutes(r, assetcatalog.NewHandler(deps.DB, deps.Config.AssetCatalog), authMiddleware)
 	activitypub.RegisterRoutes(r, activitypub.NewHandler(deps.DB, deps.Config))

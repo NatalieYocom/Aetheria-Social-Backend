@@ -11,6 +11,7 @@ import (
 	"basisvr-social-service/internal/common/httpx"
 	"basisvr-social-service/internal/common/page"
 	"basisvr-social-service/internal/notifications"
+	"basisvr-social-service/internal/privacy"
 	"basisvr-social-service/internal/realtime"
 
 	"github.com/go-chi/chi/v5"
@@ -38,6 +39,7 @@ func RegisterRoutes(r chi.Router, h *Handler, authMiddleware func(http.Handler) 
 		r.Post("/api/friends/request", h.FriendRequest)
 		r.Post("/api/friends/accept", h.FriendAccept)
 		r.Post("/api/friends/reject", h.FriendReject)
+		r.Post("/api/friends/remove", h.FriendRemove)
 		r.Get("/api/friends", h.Friends)
 		r.Get("/api/followers", h.Followers)
 		r.Get("/api/following", h.Following)
@@ -95,7 +97,23 @@ func (h *Handler) FriendReject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Friends(w http.ResponseWriter, r *http.Request) {
-	h.listByRelation(w, r, "friend", "accepted", "")
+	state := r.URL.Query().Get("state")
+	if state == "" {
+		state = "accepted"
+	}
+	direction := r.URL.Query().Get("direction")
+	if state != "accepted" && state != "pending" {
+		httpx.WriteError(w, 400, "invalid_state", "state must be accepted or pending")
+		return
+	}
+	if direction != "" && direction != "incoming" && direction != "outgoing" {
+		httpx.WriteError(w, 400, "invalid_direction", "direction must be incoming or outgoing")
+		return
+	}
+	if state == "pending" && direction == "" {
+		direction = "incoming"
+	}
+	h.listByRelation(w, r, "friend", state, direction)
 }
 
 func (h *Handler) Followers(w http.ResponseWriter, r *http.Request) {
@@ -121,15 +139,34 @@ func (h *Handler) Block(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid_target", "cannot block yourself")
 		return
 	}
-	if _, err := h.db.ExecContext(r.Context(), `
-INSERT INTO relationships (actor_id, target_actor_id, type, direction, state)
-VALUES ($1, $2, 'block', 'outgoing', 'accepted')
-ON CONFLICT (actor_id, target_actor_id, type)
-DO UPDATE SET direction = 'outgoing', state = 'accepted'`,
-		principal.ActorID, targetID); err != nil {
-		httpx.WriteError(w, http.StatusInternalServerError, "block_failed", err.Error())
+	tx, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		httpx.WriteError(w, 500, "block_failed", err.Error())
 		return
 	}
+	defer tx.Rollback()
+	if err = privacy.LockPair(r.Context(), tx, principal.ActorID, targetID); err != nil {
+		httpx.WriteError(w, 500, "block_failed", err.Error())
+		return
+	}
+	if _, err = tx.ExecContext(r.Context(), `INSERT INTO relationships (actor_id,target_actor_id,type,direction,state) VALUES ($1,$2,'block','outgoing','accepted') ON CONFLICT(actor_id,target_actor_id,type) DO UPDATE SET state='accepted'`, principal.ActorID, targetID); err != nil {
+		httpx.WriteError(w, 500, "block_failed", err.Error())
+		return
+	}
+	if _, err = tx.ExecContext(r.Context(), `DELETE FROM relationships WHERE type IN ('friend','follow') AND ((actor_id=$1 AND target_actor_id=$2) OR (actor_id=$2 AND target_actor_id=$1))`, principal.ActorID, targetID); err != nil {
+		httpx.WriteError(w, 500, "block_failed", err.Error())
+		return
+	}
+	if _, err = tx.ExecContext(r.Context(), `UPDATE invites SET state='declined' WHERE state IN ('pending','accepted') AND ((from_actor_id=$1 AND to_actor_id=$2) OR (from_actor_id=$2 AND to_actor_id=$1))`, principal.ActorID, targetID); err != nil {
+		httpx.WriteError(w, 500, "block_failed", err.Error())
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		httpx.WriteError(w, 500, "block_failed", err.Error())
+		return
+	}
+	publishRelationshipRemoved(h.events, principal.ActorID, targetID)
+
 	realtime.PublishActorEvent(h.events, []uuid.UUID{principal.ActorID}, "user.blocked", principal.ActorID, relationshipEventPayload(principal.ActorID, targetID, "block", "accepted"))
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"state": "blocked"})
 }
@@ -181,6 +218,25 @@ func (h *Handler) edgeAction(w http.ResponseWriter, r *http.Request, relationTyp
 		_ = tx.Rollback()
 	}()
 
+	if !h.authorizePair(w, r, tx, principal.ActorID, targetID) {
+		return
+	}
+	if relationType == "friend" {
+		var existingState, existingDirection string
+		err := tx.QueryRowContext(r.Context(), `SELECT state,direction FROM relationships WHERE actor_id=$1 AND target_actor_id=$2 AND type='friend'`, principal.ActorID, targetID).Scan(&existingState, &existingDirection)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			httpx.WriteError(w, 500, "relationship_failed", err.Error())
+			return
+		}
+		if err == nil && (existingState == "accepted" || existingState == "pending") {
+			if existingState == "pending" && existingDirection == "incoming" {
+				httpx.WriteError(w, 409, "incoming_request_exists", "respond to the incoming friend request")
+				return
+			}
+			httpx.WriteJSON(w, 200, map[string]string{"type": "friend", "state": existingState})
+			return
+		}
+	}
 	if _, err := tx.ExecContext(r.Context(), `
 INSERT INTO relationships (actor_id, target_actor_id, type, direction, state)
 VALUES ($1, $2, $3, $4, $5)
@@ -240,6 +296,10 @@ func (h *Handler) friendDecision(w http.ResponseWriter, r *http.Request, state s
 			_ = tx.Rollback()
 		}
 	}()
+
+	if !h.authorizePair(w, r, tx, principal.ActorID, targetID) {
+		return
+	}
 
 	result, err := tx.ExecContext(r.Context(), `
 UPDATE relationships
@@ -327,6 +387,7 @@ LEFT JOIN users u ON u.id = a.local_user_id
 LEFT JOIN profiles p ON p.user_id = u.id
 WHERE rel.actor_id = $1 AND rel.type = $2 AND rel.state = $3
   AND (a.local_user_id IS NULL OR u.status = 'active')
+  AND NOT EXISTS (SELECT 1 FROM relationships b WHERE b.type='block' AND b.state='accepted' AND ((b.actor_id=$1 AND b.target_actor_id=a.id) OR (b.actor_id=a.id AND b.target_actor_id=$1)))
   AND ($4::text IS NULL OR rel.direction = $4)
   AND ($5::text IS NULL OR (lower(a.acct), a.id) > ($5, $6))
 ORDER BY lower(a.acct), a.id
@@ -430,4 +491,52 @@ LEFT JOIN users u ON u.id = a.local_user_id
 WHERE (lower(a.acct) = $1 OR lower(a.preferred_username) = $1)
   AND (a.local_user_id IS NULL OR u.status = 'active')`, value).Scan(&id)
 	return id, err
+}
+
+func (h *Handler) authorizePair(w http.ResponseWriter, r *http.Request, tx *sql.Tx, first, second uuid.UUID) bool {
+	if err := privacy.LockPair(r.Context(), tx, first, second); err != nil {
+		httpx.WriteError(w, 500, "relationship_failed", err.Error())
+		return false
+	}
+	blocked, err := privacy.HasBlock(r.Context(), tx, first, second)
+	if err != nil {
+		httpx.WriteError(w, 500, "relationship_failed", err.Error())
+		return false
+	}
+	if blocked {
+		httpx.WriteError(w, 403, "relationship_unavailable", "interaction is unavailable")
+		return false
+	}
+	return true
+}
+func (h *Handler) FriendRemove(w http.ResponseWriter, r *http.Request) {
+	principal, target, ok := h.resolveRequestTarget(w, r)
+	if !ok {
+		return
+	}
+	tx, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		httpx.WriteError(w, 500, "relationship_failed", err.Error())
+		return
+	}
+	defer tx.Rollback()
+	if err = privacy.LockPair(r.Context(), tx, principal.ActorID, target); err != nil {
+		httpx.WriteError(w, 500, "relationship_failed", err.Error())
+		return
+	}
+	if _, err = tx.ExecContext(r.Context(), `DELETE FROM relationships WHERE type='friend' AND ((actor_id=$1 AND target_actor_id=$2) OR (actor_id=$2 AND target_actor_id=$1))`, principal.ActorID, target); err != nil {
+		httpx.WriteError(w, 500, "relationship_failed", err.Error())
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		httpx.WriteError(w, 500, "relationship_failed", err.Error())
+		return
+	}
+	publishRelationshipRemoved(h.events, principal.ActorID, target)
+	w.WriteHeader(204)
+}
+func publishRelationshipRemoved(b *realtime.Broker, first, second uuid.UUID) {
+	realtime.PublishActorEvent(b, []uuid.UUID{first}, "presence.removed", second, map[string]string{"actorId": second.String()})
+	realtime.PublishActorEvent(b, []uuid.UUID{second}, "presence.removed", first, map[string]string{"actorId": first.String()})
+	realtime.PublishActorEvent(b, []uuid.UUID{first, second}, "friend.removed", first, relationshipEventPayload(first, second, "friend", "removed"))
 }

@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -16,6 +17,8 @@ type Principal struct {
 	ActorID     uuid.UUID
 	Username    string
 	AuthVersion int64
+	SessionID   uuid.UUID
+	ExpiresAt   time.Time
 }
 
 func ContextWithPrincipal(ctx context.Context, principal Principal) context.Context {
